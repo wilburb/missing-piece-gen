@@ -110,8 +110,21 @@ def main(
         pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
 
         # 5. Infer the missing piece shape
+        # Use the slot bounding box for authoritative piece dimensions.
+        slot_box = next(
+            (p.slot_bounding_box for p in pieces if p.slot_bounding_box is not None),
+            None,
+        )
+        slot_width_px = float(slot_box[2]) if slot_box else None
+        slot_height_px = float(slot_box[3]) if slot_box else None
+
         click.echo("Inferring missing piece shape...")
-        shape = inference.infer_shape(all_edges, pixel_to_mm_scale)
+        shape = inference.infer_shape(
+            all_edges,
+            pixel_to_mm_scale,
+            slot_width_px=slot_width_px,
+            slot_height_px=slot_height_px,
+        )
 
         # 6. Generate and write the 3D model
         click.echo(f"Generating 3D model (format={output_format})...")
