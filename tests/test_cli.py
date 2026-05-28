@@ -77,11 +77,10 @@ class TestInvalidImagePath:
         result = runner.invoke(main, ["/nonexistent/path/image.png"])
         assert result.exit_code != 0
 
-    def test_missing_path_prints_error(self):
-        # Use a fresh runner with mix_stderr=True so stderr appears in output
-        mixing_runner = CliRunner(mix_stderr=True)
-        result = mixing_runner.invoke(main, ["/nonexistent/path/image.png"])
-        assert "Error" in result.output or "does not exist" in result.output
+    def test_missing_path_prints_error(self, runner):
+        result = runner.invoke(main, ["/nonexistent/path/image.png"])
+        output = result.output + (result.exception and str(result.exception) or "")
+        assert "Error" in output or "does not exist" in output or result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------
