@@ -19,13 +19,19 @@ _MAX_CONTOUR_AREA_FRACTION = 0.70
 _PIECE_INTENSITY_OFFSET = 3
 
 # ---------------------------------------------------------------------------
-# Prusa orange slot-marker colour (OpenCV HSV, H: 0–180, S/V: 0–255)
+# Prusa orange backdrop colour (OpenCV HSV, H: 0–180, S/V: 0–255)
 # Prusa orange ≈ #FA6831 → H 18°, S 80%, V 98%
 # The range below is deliberately wide to handle typical indoor lighting variation.
 # After each run the detected mean HSV is printed so this range can be refined.
 # ---------------------------------------------------------------------------
 _ORANGE_HSV_LOW  = np.array([5,  100,  80], dtype=np.uint8)
 _ORANGE_HSV_HIGH = np.array([25, 255, 255], dtype=np.uint8)
+
+# When orange covers more than this fraction of the total image area it is
+# treated as a full backdrop rather than a small interior slot marker.
+# A full backdrop WILL touch all four image edges — the touches_edge guard is
+# intentionally relaxed for regions above this size threshold.
+_ORANGE_BACKDROP_FRACTION = 0.10
 
 
 def _check_blur(gray: np.ndarray) -> None:
@@ -38,33 +44,71 @@ def _check_blur(gray: np.ndarray) -> None:
         )
 
 
-def _find_slot_contour_by_orange(
+def _find_orange_backdrop(
     hsv: np.ndarray,
     img_w: int,
     img_h: int,
-) -> tuple[np.ndarray | None, str]:
-    """Find the missing-slot contour by looking for the Prusa orange colour marker.
+) -> tuple[np.ndarray | None, bool, str]:
+    """Detect Prusa orange in the image and determine how it should be used.
 
-    The caller should place a piece of Prusa-orange paper in the slot before
-    photographing; this function detects the most prominent orange region that
-    does not touch the image border.
+    Two modes are distinguished:
 
-    Returns (contour_or_None, status_message).
-    The status message is always populated so the caller can print it.
+    * **Backdrop mode** – the orange region is dominant (covers more than
+      ``_ORANGE_BACKDROP_FRACTION`` of the image area).  In this case the
+      orange spans the whole background and its bounding rect will touch the
+      image borders.  The function returns the largest orange contour regardless
+      of border contact and sets ``is_backdrop=True``.  The caller should then
+      find pieces as the non-orange blobs within the frame rather than using
+      intensity thresholding.
+
+    * **Slot-marker mode** – a smaller orange region that does NOT touch the
+      border, intended as a colour-coded slot marker placed inside the missing
+      slot.  ``is_backdrop=False``.
+
+    Returns:
+        (contour_or_None, is_backdrop, status_message)
     """
+    img_area = float(img_h * img_w)
+
     mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
 
-    # Morphological cleanup: close small gaps, remove small specks
+    # Morphological cleanup: close small gaps, remove small specks.
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
 
     orange_px = int(np.count_nonzero(mask))
+    orange_fraction = orange_px / img_area
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    best: np.ndarray | None = None
-    best_area = 0.0
+    # --- Pass 1: look for a backdrop (large orange region, may touch border) ---
+    backdrop_best: np.ndarray | None = None
+    backdrop_best_area = 0.0
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < _MIN_CONTOUR_AREA:
+            continue
+        # Accept large orange regions even if they touch the image border.
+        if area / img_area >= _ORANGE_BACKDROP_FRACTION:
+            if area > backdrop_best_area:
+                backdrop_best_area = area
+                backdrop_best = c
+
+    if backdrop_best is not None:
+        bx, by, bw, bh = cv2.boundingRect(backdrop_best)
+        msg = (
+            f"  [orange] Backdrop detected: "
+            f"bbox=({bx}, {by}, {bw}×{bh} px)  area={backdrop_best_area:.0f} px²  "
+            f"({100 * backdrop_best_area / img_area:.1f}% of image).\n"
+            "         Piece detection will use non-orange blob strategy."
+        )
+        return backdrop_best, True, msg
+
+    # --- Pass 2: look for a smaller interior slot marker (must not touch border) ---
+    marker_best: np.ndarray | None = None
+    marker_best_area = 0.0
     for c in contours:
         area = cv2.contourArea(c)
         if area < _MIN_CONTOUR_AREA:
@@ -77,35 +121,34 @@ def _find_slot_contour_by_orange(
         )
         if touches_edge:
             continue
-        if area > best_area:
-            best_area = area
-            best = c
+        if area > marker_best_area:
+            marker_best_area = area
+            marker_best = c
 
-    if best is None:
-        return None, (
-            f"  [slot] No orange marker found "
-            f"(total orange pixels in image: {orange_px}; "
+    if marker_best is None:
+        return None, False, (
+            f"  [orange] No orange region found "
+            f"(total orange pixels: {orange_px}; fraction={orange_fraction:.3f}; "
             f"expected HSV {_ORANGE_HSV_LOW.tolist()} – {_ORANGE_HSV_HIGH.tolist()}). "
-            "Falling back to dark-region detection."
+            "Falling back to dark-region slot detection."
         )
 
-    # Compute mean HSV of the detected orange region so the user can
-    # verify / refine the hardcoded range.
-    sx, sy, sw, sh = cv2.boundingRect(best)
+    # Report mean HSV of the detected marker so the user can refine the range.
+    sx, sy, sw, sh = cv2.boundingRect(marker_best)
     slot_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    cv2.drawContours(slot_mask, [best], -1, 255, cv2.FILLED)
+    cv2.drawContours(slot_mask, [marker_best], -1, 255, cv2.FILLED)
     mean_vals = cv2.mean(hsv, mask=slot_mask)
     mean_h, mean_s, mean_v = mean_vals[0], mean_vals[1], mean_vals[2]
 
     msg = (
-        f"  [slot] Orange marker detected: "
-        f"bbox=({sx}, {sy}, {sw}×{sh} px)  area={best_area:.0f} px²\n"
+        f"  [orange] Slot marker detected: "
+        f"bbox=({sx}, {sy}, {sw}×{sh} px)  area={marker_best_area:.0f} px²\n"
         f"         Detected mean HSV=({mean_h:.0f}, {mean_s:.0f}, {mean_v:.0f})  "
         f"[hardcoded range H {_ORANGE_HSV_LOW[0]}–{_ORANGE_HSV_HIGH[0]}, "
         f"S {_ORANGE_HSV_LOW[1]}–{_ORANGE_HSV_HIGH[1]}, "
         f"V {_ORANGE_HSV_LOW[2]}–{_ORANGE_HSV_HIGH[2]}]"
     )
-    return best, msg
+    return marker_best, False, msg
 
 
 def _find_slot_contour(
@@ -189,7 +232,7 @@ def _find_piece_contours(
     img_area: float,
     slot_mask: np.ndarray | None = None,
 ) -> list[np.ndarray]:
-    """Find contours that correspond to puzzle pieces.
+    """Find contours that correspond to puzzle pieces (intensity-threshold strategy).
 
     Excludes the slot region (if slot_mask provided) and uses a size-relative
     minimum area to reject countertop specks and small noise blobs.
@@ -215,14 +258,81 @@ def _find_piece_contours(
     ]
 
 
+def _find_piece_contours_by_non_orange(
+    hsv: np.ndarray,
+    orange_mask: np.ndarray,
+    img_w: int,
+    img_h: int,
+    img_area: float,
+) -> list[np.ndarray]:
+    """Find piece contours as non-orange blobs within an orange backdrop.
+
+    When the background is a uniform Prusa-orange surface, pieces appear as
+    non-orange regions.  This function:
+      1. Inverts the orange mask to get a ``non_orange_mask``.
+      2. Applies morphological cleanup to merge fragmented blobs and remove
+         noise from anti-aliased edges.
+      3. Returns contours of blobs that are large enough to be a piece but
+         not so large that they span the whole image.
+
+    This avoids the intensity-threshold approach used by ``_find_piece_contours``,
+    which would trace every bright internal detail on a piece's surface.
+
+    Args:
+        hsv:         HSV image (same size as the original).
+        orange_mask: Binary mask where 255 = orange pixel (after morphological
+                     cleanup; produced by ``_find_orange_backdrop``).
+        img_w:       Image width in pixels.
+        img_h:       Image height in pixels.
+        img_area:    Total image area in pixels² (float).
+
+    Returns:
+        List of contour arrays, one per detected non-orange blob.
+    """
+    # Rebuild the clean orange mask from HSV (same pipeline as _find_orange_backdrop).
+    mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
+
+    # Non-orange pixels are our candidate piece regions.
+    non_orange = cv2.bitwise_not(mask)
+
+    # Additional morphological cleanup on the non-orange mask:
+    # close gaps that result from orange bleed into piece edges.
+    piece_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    non_orange = cv2.morphologyEx(non_orange, cv2.MORPH_CLOSE, piece_kernel)
+    non_orange = cv2.morphologyEx(non_orange, cv2.MORPH_OPEN, piece_kernel)
+
+    contours, _ = cv2.findContours(non_orange, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Use a size-relative lower bound: at least 0.05% of image area.
+    min_area = max(_MIN_CONTOUR_AREA, img_area * 0.0005)
+    return [
+        c for c in contours
+        if min_area <= cv2.contourArea(c) <= _MAX_CONTOUR_AREA_FRACTION * img_area
+    ]
+
+
 def segment(image: np.ndarray) -> list[PieceRegion]:
     """Detect surrounding puzzle pieces and the missing center slot.
 
-    Slot detection strategy (in order):
-      1. Prusa orange colour marker — place a piece of Prusa-orange paper in the
-         slot before photographing.  Prints the detected mean HSV each run so
-         the hardcoded range (_ORANGE_HSV_LOW / _ORANGE_HSV_HIGH) can be refined.
-      2. Dark-region fallback — largest interior dark contour (Otsu threshold).
+    Slot / backdrop detection strategy (in order):
+
+    1. **Orange backdrop** – if a Prusa-orange region covers >10% of the image
+       the entire background is treated as the orange surface.  Piece contours
+       are then found as *non-orange* blobs (``_find_piece_contours_by_non_orange``).
+       The backdrop contour defines the overall image boundary used for
+       ``slot_bounding_box`` context.
+
+    2. **Orange slot marker** – if a smaller orange region that does NOT touch
+       the image border is found, it is treated as a colour-coded slot marker
+       placed inside the missing slot.  Piece contours are found via intensity
+       thresholding (``_find_piece_contours``).
+
+    3. **Dark-region fallback** – largest interior dark contour (Otsu threshold).
+       Piece contours are found via intensity thresholding.
 
     Args:
         image: BGR image as numpy array (from cv2.imread).
@@ -231,7 +341,8 @@ def segment(image: np.ndarray) -> list[PieceRegion]:
         List of PieceRegion objects, one per detected surrounding piece.
 
     Raises:
-        DetectionError: If pieces or missing slot cannot be detected.
+        DetectionError: If pieces or missing slot cannot be detected,
+                        or if the image is None, empty, or too blurry.
     """
     if image is None or image.size == 0:
         raise DetectionError("Input image is None or empty.")
@@ -248,14 +359,19 @@ def segment(image: np.ndarray) -> list[PieceRegion]:
 
     _check_blur(gray)
 
-    # --- Slot detection: orange marker first, dark-region fallback ---
+    # --- Slot / backdrop detection -------------------------------------------
     slot_contour: np.ndarray | None = None
-    slot_mask_filled: np.ndarray | None = None
+    use_non_orange_piece_detection = False
+    hsv: np.ndarray | None = None
 
     if image.ndim == 3:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        slot_contour, orange_msg = _find_slot_contour_by_orange(hsv, img_w, img_h)
+        orange_contour, is_backdrop, orange_msg = _find_orange_backdrop(hsv, img_w, img_h)
         print(orange_msg)
+
+        if orange_contour is not None:
+            slot_contour = orange_contour
+            use_non_orange_piece_detection = is_backdrop
 
     if slot_contour is None:
         slot_contour = _find_slot_contour(gray, img_w, img_h)
@@ -264,7 +380,7 @@ def segment(image: np.ndarray) -> list[PieceRegion]:
 
     if slot_contour is None:
         raise DetectionError(
-            "Could not identify the missing slot. "
+            "Could not identify the missing slot or orange backdrop. "
             "Place a piece of Prusa-orange paper in the slot and retake the photo, "
             "or ensure the slot appears as a clearly dark gap with no other dark regions."
         )
@@ -272,19 +388,26 @@ def segment(image: np.ndarray) -> list[PieceRegion]:
     sx, sy, sw, sh = cv2.boundingRect(slot_contour)
     slot_box: tuple[int, int, int, int] = (sx, sy, sw, sh)
 
-    # Build a filled slot mask to exclude the slot area from piece detection.
-    slot_mask_filled = np.zeros((img_h, img_w), dtype=np.uint8)
-    cv2.drawContours(slot_mask_filled, [slot_contour], -1, 255, cv2.FILLED)
+    # --- Piece detection -----------------------------------------------------
+    if use_non_orange_piece_detection:
+        # Build the orange mask for piece detection (HSV already computed above).
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+        piece_contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, img_w, img_h, img_area
+        )
+    else:
+        # Build a filled slot mask to exclude the slot area from piece detection.
+        slot_mask_filled = np.zeros((img_h, img_w), dtype=np.uint8)
+        cv2.drawContours(slot_mask_filled, [slot_contour], -1, 255, cv2.FILLED)
+        piece_contours = _find_piece_contours(gray, img_w, img_h, img_area, slot_mask_filled)
 
-    # --- Piece detection ---
-    piece_contours = _find_piece_contours(gray, img_w, img_h, img_area, slot_mask_filled)
     if not piece_contours:
         raise DetectionError(
             "No surrounding puzzle pieces could be identified. "
-            "Ensure the image shows puzzle pieces surrounding the missing slot."
+            "Ensure the image shows puzzle pieces surrounding a missing slot."
         )
 
-    # --- Build PieceRegion objects ---
+    # --- Build PieceRegion objects -------------------------------------------
     piece_regions: list[PieceRegion] = []
     for piece_id, c in enumerate(piece_contours):
         bx, by, bw, bh = cv2.boundingRect(c)
