@@ -2,6 +2,7 @@
 
 import sys
 import os
+from pathlib import Path
 
 import click
 import cv2
@@ -10,6 +11,8 @@ import numpy as np
 from missing_piece_gen import __version__
 from missing_piece_gen.errors import PipelineError
 from missing_piece_gen import segmentation, edge_analysis, inference, model_gen
+from missing_piece_gen import debug_viz
+from missing_piece_gen.inference import _OPPOSITE
 
 OUTPUT_FORMATS = ("stl", "obj")
 
@@ -58,6 +61,16 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
     type=float,
     help="Estimated real-world width of a puzzle piece in mm (used for pixel-to-mm scale).",
 )
+@click.option(
+    "--debug-dir",
+    default=None,
+    metavar="<dir>",
+    help=(
+        "Directory to write debug images. "
+        "Saves debug_detection.jpg (annotated input with detected pieces/slot/edge types) "
+        "and debug_shape.jpg (inferred 2D outline with edge-type labels)."
+    ),
+)
 def main(
     image_path: str,
     output: str,
@@ -65,6 +78,7 @@ def main(
     thickness: float,
     bevel: float,
     piece_width_mm: float,
+    debug_dir: str | None,
 ) -> None:
     """Generate a 3D-printable missing puzzle piece from IMAGE_PATH.
 
@@ -91,6 +105,7 @@ def main(
         # 3. Segment surrounding pieces
         click.echo("Detecting missing region...")
         pieces = segmentation.segment(image)
+        click.echo(f"  Found {len(pieces)} surrounding piece(s).")
 
         # 4. Extract edge profiles for each piece
         click.echo("Extracting edge profiles...")
@@ -98,8 +113,17 @@ def main(
         for piece in pieces:
             profiles = edge_analysis.extract_edges(piece)
             all_edges.extend(profiles)
+            for ep in profiles:
+                depth_str = (
+                    f", depth={ep.tab_geometry.depth:.1f}px"
+                    if ep.tab_geometry else ""
+                )
+                click.echo(
+                    f"  Piece #{piece.piece_id} {ep.direction!r:8s} "
+                    f"→ {ep.edge_type.value}{depth_str}"
+                )
 
-        # Compute pixel-to-mm scale from the average bounding-box width of pieces.
+        # 5. Compute pixel-to-mm scale from the average bounding-box width of pieces.
         widths_px = []
         for piece in pieces:
             if piece.bounding_polygon is not None and len(piece.bounding_polygon) >= 2:
@@ -108,12 +132,16 @@ def main(
                     widths_px.append(w)
         avg_piece_width_px = float(np.mean(widths_px)) if widths_px else _FALLBACK_PIECE_WIDTH_PX
         pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
+        click.echo(
+            f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
+            f"(avg piece width {avg_piece_width_px:.0f} px = {piece_width_mm:.1f} mm)"
+        )
 
-        # 5. Estimate slot dimensions from the surrounding pieces themselves.
+        # 6. Estimate slot dimensions from the surrounding pieces themselves.
         #
-        # The slot bounding box from segmentation can be unreliable in real photos
-        # (shadows, dark puzzle artwork, or table background may be detected
-        # instead of the actual gap).  Instead, derive dimensions from neighbours:
+        # The slot bounding box from segmentation is unreliable in real photos
+        # (shadows, dark artwork, or background can be detected instead of the gap).
+        # Derive dimensions from neighbours instead:
         #   - pieces above/below the slot → their bounding width ≈ slot width
         #   - pieces left/right of the slot → their bounding height ≈ slot height
         slot_width_candidates: list[float] = []
@@ -147,6 +175,7 @@ def main(
                 f"{slot_height_px * pixel_to_mm_scale:.1f} mm"
             )
 
+        # 7. Infer the missing piece shape
         click.echo("Inferring missing piece shape...")
         shape = inference.infer_shape(
             all_edges,
@@ -154,8 +183,30 @@ def main(
             slot_width_px=slot_width_px,
             slot_height_px=slot_height_px,
         )
+        click.echo(
+            f"  Shape: {shape.width_mm:.1f} × {shape.height_mm:.1f} mm"
+        )
 
-        # 6. Generate and write the 3D model
+        # 8. Debug images (optional)
+        if debug_dir is not None:
+            ddir = Path(debug_dir)
+            det_path = debug_viz.save_detection_image(
+                image, pieces, all_edges, ddir / "debug_detection.jpg"
+            )
+            click.echo(f"  Debug detection image: {det_path}")
+
+            # Build profiles_by_dir for the shape image
+            profiles_by_dir: dict = {}
+            for ep in all_edges:
+                missing_dir = _OPPOSITE.get(ep.direction, ep.direction)
+                if missing_dir not in profiles_by_dir:
+                    profiles_by_dir[missing_dir] = ep
+            shape_path = debug_viz.save_shape_image(
+                shape, profiles_by_dir, ddir / "debug_shape.jpg"
+            )
+            click.echo(f"  Debug shape image:     {shape_path}")
+
+        # 9. Generate and write the 3D model
         click.echo(f"Generating 3D model (format={output_format})...")
         model_gen.generate(
             shape,
@@ -165,7 +216,7 @@ def main(
             bevel_mm=bevel,
         )
 
-        # 7. Success
+        # 10. Success
         click.echo(f"Done. Output written to: {output}")
 
     except PipelineError as exc:
