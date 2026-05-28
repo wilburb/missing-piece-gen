@@ -109,14 +109,43 @@ def main(
         avg_piece_width_px = float(np.mean(widths_px)) if widths_px else _FALLBACK_PIECE_WIDTH_PX
         pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
 
-        # 5. Infer the missing piece shape
-        # Use the slot bounding box for authoritative piece dimensions.
-        slot_box = next(
-            (p.slot_bounding_box for p in pieces if p.slot_bounding_box is not None),
-            None,
+        # 5. Estimate slot dimensions from the surrounding pieces themselves.
+        #
+        # The slot bounding box from segmentation can be unreliable in real photos
+        # (shadows, dark puzzle artwork, or table background may be detected
+        # instead of the actual gap).  Instead, derive dimensions from neighbours:
+        #   - pieces above/below the slot → their bounding width ≈ slot width
+        #   - pieces left/right of the slot → their bounding height ≈ slot height
+        slot_width_candidates: list[float] = []
+        slot_height_candidates: list[float] = []
+        for piece in pieces:
+            if piece.bounding_polygon is None or len(piece.bounding_polygon) < 2:
+                continue
+            pw = float(np.ptp(piece.bounding_polygon[:, 0]))
+            ph = float(np.ptp(piece.bounding_polygon[:, 1]))
+            for edge_dir in piece.inward_edges:
+                if edge_dir in ("top", "bottom") and pw > 0:
+                    slot_width_candidates.append(pw)
+                elif edge_dir in ("left", "right") and ph > 0:
+                    slot_height_candidates.append(ph)
+
+        slot_width_px: float | None = (
+            float(np.mean(slot_width_candidates)) if slot_width_candidates else None
         )
-        slot_width_px = float(slot_box[2]) if slot_box else None
-        slot_height_px = float(slot_box[3]) if slot_box else None
+        slot_height_px: float | None = (
+            float(np.mean(slot_height_candidates)) if slot_height_candidates else None
+        )
+        if slot_width_px is None:
+            slot_width_px = avg_piece_width_px if avg_piece_width_px > 0 else None
+        if slot_height_px is None:
+            slot_height_px = avg_piece_width_px if avg_piece_width_px > 0 else None
+
+        if slot_width_px and slot_height_px:
+            click.echo(
+                f"  Piece size estimate: "
+                f"{slot_width_px * pixel_to_mm_scale:.1f} × "
+                f"{slot_height_px * pixel_to_mm_scale:.1f} mm"
+            )
 
         click.echo("Inferring missing piece shape...")
         shape = inference.infer_shape(
