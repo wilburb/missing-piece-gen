@@ -51,5 +51,5 @@ def write_output(model_data: dict, output_path: str) -> None:
         output_path: Destination file path.
     """
     with open(output_path, "w") as fh:
-        fh.write(f"# missing-piece-gen stub output\n")
+        fh.write("# missing-piece-gen stub output\n")
         fh.write(f"# format: {model_data['format']}\n")

@@ -1,6 +1,6 @@
 """Stage 3: Infer the 2D outline of the missing puzzle piece from surrounding edge profiles."""
 import numpy as np
-from .models import EdgeProfile, MissingPieceShape, EdgeType
+from .models import EdgeProfile, MissingPieceShape
 from .errors import InferenceError
 
 _DIRECTIONS = ("top", "right", "bottom", "left")
