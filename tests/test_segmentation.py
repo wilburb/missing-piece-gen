@@ -3,7 +3,12 @@ import numpy as np
 import cv2
 import pytest
 
-from missing_piece_gen.segmentation import segment
+from missing_piece_gen.segmentation import (
+    segment,
+    _find_orange_backdrop,
+    _ORANGE_HSV_LOW,
+    _ORANGE_HSV_HIGH,
+)
 from missing_piece_gen.models import PieceRegion
 from missing_piece_gen.errors import DetectionError
 
@@ -129,3 +134,141 @@ def test_segment_raises_on_uniform_image():
     uniform = np.full((300, 300, 3), 128, dtype=np.uint8)
     with pytest.raises(DetectionError):
         segment(uniform)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for orange-backdrop tests
+# ---------------------------------------------------------------------------
+
+
+def _orange_bgr() -> tuple[int, int, int]:
+    """Return a BGR colour that falls within the Prusa-orange HSV range."""
+    # Prusa orange #FA6831 → BGR (49, 104, 250)
+    return (49, 104, 250)
+
+
+def make_orange_backdrop_image(
+    width: int = 400,
+    height: int = 400,
+    piece_rects: list[tuple[int, int, int, int]] | None = None,
+) -> np.ndarray:
+    """Create a synthetic image with a full Prusa-orange backdrop.
+
+    The orange region fills the entire canvas (touches all four borders).
+    Non-orange rectangles represent puzzle pieces placed on the surface.
+
+    Args:
+        width:       Image width in pixels.
+        height:      Image height in pixels.
+        piece_rects: List of (x1, y1, x2, y2) rectangles to draw as
+                     dark-gray pieces on top of the orange backdrop.
+                     Defaults to two rectangles left/right of centre.
+
+    Returns:
+        BGR image as a numpy array.
+    """
+    bgr = _orange_bgr()
+    img = np.full((height, width, 3), bgr, dtype=np.uint8)
+
+    if piece_rects is None:
+        cx, cy = width // 2, height // 2
+        piece_rects = [
+            (20, 20, cx - 20, height - 20),    # left piece
+            (cx + 20, 20, width - 20, height - 20),  # right piece
+        ]
+
+    piece_color = (60, 60, 60)  # dark gray — clearly non-orange
+    for x1, y1, x2, y2 in piece_rects:
+        cv2.rectangle(img, (x1, y1), (x2, y2), piece_color, -1)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Tests: orange backdrop detection (issue #30)
+# ---------------------------------------------------------------------------
+
+
+def test_orange_backdrop_detected_when_touching_edges():
+    """_find_orange_backdrop returns is_backdrop=True even when orange spans the image.
+
+    Regression test for issue #30: the old touches_edge guard would reject a
+    full-background orange region because its bounding rect necessarily touches
+    all four image borders.  The new implementation accepts it when the orange
+    covers > _ORANGE_BACKDROP_FRACTION of the image area.
+    """
+    img = make_orange_backdrop_image(piece_rects=[(20, 20, 180, 380), (220, 20, 380, 380)])
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, w = img.shape[:2]
+
+    contour, is_backdrop, msg = _find_orange_backdrop(hsv, w, h)
+
+    assert contour is not None, f"Expected orange contour to be found; msg={msg!r}"
+    assert is_backdrop is True, (
+        f"Expected is_backdrop=True for a full-canvas orange region; msg={msg!r}"
+    )
+
+
+def test_orange_backdrop_contour_covers_most_of_image():
+    """The detected backdrop contour should span most of the image."""
+    img = make_orange_backdrop_image()
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, w = img.shape[:2]
+    img_area = float(h * w)
+
+    contour, is_backdrop, _ = _find_orange_backdrop(hsv, w, h)
+
+    assert contour is not None
+    assert is_backdrop is True
+    # The orange fills the entire canvas so its contour area should be large.
+    area = cv2.contourArea(contour)
+    assert area / img_area >= 0.10, f"Expected contour area >= 10% of image, got {area / img_area:.3f}"
+
+
+def test_segment_orange_backdrop_finds_piece_contours():
+    """segment() detects pieces as non-orange blobs when the backdrop is orange.
+
+    Verifies end-to-end that:
+    - Two piece-shaped rectangles on an orange surface are returned as PieceRegions.
+    - slot_bounding_box is populated.
+    - piece_id values are unique.
+    """
+    img = make_orange_backdrop_image(
+        width=400,
+        height=400,
+        piece_rects=[(20, 20, 180, 380), (220, 20, 380, 380)],
+    )
+    regions = segment(img)
+
+    assert len(regions) >= 1, "Expected at least one piece region on an orange backdrop"
+    for region in regions:
+        assert isinstance(region, PieceRegion)
+        assert region.slot_bounding_box is not None
+        x, y, w, h = region.slot_bounding_box
+        assert w > 0 and h > 0
+
+    ids = [r.piece_id for r in regions]
+    assert len(ids) == len(set(ids)), "piece_id values should be unique"
+
+
+def test_segment_orange_backdrop_piece_crop_is_not_orange():
+    """Piece crops from an orange-backdrop image should NOT be predominantly orange.
+
+    This guards against the regression where the orange backdrop itself was
+    returned as a 'piece' rather than the actual non-orange objects on it.
+    """
+    img = make_orange_backdrop_image(
+        width=400,
+        height=400,
+        piece_rects=[(20, 20, 180, 380), (220, 20, 380, 380)],
+    )
+    regions = segment(img)
+
+    for region in regions:
+        crop_hsv = cv2.cvtColor(region.crop, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(crop_hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+        orange_fraction = np.count_nonzero(orange_mask) / float(orange_mask.size)
+        assert orange_fraction < 0.5, (
+            f"Piece crop (id={region.piece_id}) is >50% orange "
+            f"({orange_fraction:.2%}); the backdrop was likely detected as a piece."
+        )
