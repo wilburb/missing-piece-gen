@@ -61,16 +61,28 @@ def _extract_single_edge(piece: PieceRegion, direction: str) -> EdgeProfile:
     # actual intensity distribution in the ROI.  A fixed threshold of 10 made
     # the entire mask white for any real photo (puzzle pixels are 100-255),
     # causing findContours to trace the ROI border and yielding zero deviation.
-    blurred_gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, mask = cv2.threshold(blurred_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    #
+    # On Windows, certain row widths trigger OpenCV's SIMD path to raise an
+    # "Unknown C++ exception" inside GaussianBlur or threshold.  Wrap the entire
+    # block through findContours in a try/except and return FLAT on failure.
+    try:
+        blurred_gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask = cv2.threshold(blurred_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Morphological cleanup to remove noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        # Morphological cleanup to remove noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    # --- 3. Find contours ---
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        # --- 3. Find contours ---
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    except Exception:
+        return EdgeProfile(
+            direction=direction,
+            contour=np.empty((0, 2), dtype=np.float32),
+            edge_type=EdgeType.FLAT,
+            tab_geometry=None,
+        )
 
     if not contours:
         # Can't extract — return a flat edge with empty contour
