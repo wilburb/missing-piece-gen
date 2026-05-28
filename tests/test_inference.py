@@ -1,10 +1,8 @@
 """Tests for missing_piece_gen.inference — Stage 3: Missing piece shape inference."""
 import numpy as np
-import pytest
 
 from missing_piece_gen.models import EdgeProfile, EdgeType, TabGeometry
 from missing_piece_gen.inference import infer_shape, _shoelace_area
-from missing_piece_gen.errors import InferenceError
 
 
 # ---------------------------------------------------------------------------

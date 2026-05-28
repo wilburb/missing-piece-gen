@@ -1,5 +1,4 @@
 """Stage 4: Extrude the 2D missing piece outline into a 3D-printable solid."""
-import numpy as np
 from pathlib import Path
 import trimesh
 from shapely.geometry import Polygon

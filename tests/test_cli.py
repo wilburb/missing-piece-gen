@@ -1,7 +1,6 @@
 """Tests for the missing-piece-gen CLI (issue #3 AC coverage)."""
 
 import os
-import tempfile
 
 import pytest
 from click.testing import CliRunner
