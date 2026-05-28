@@ -8,7 +8,6 @@ import pytest
 from click.testing import CliRunner
 
 from missing_piece_gen.cli import main
-from missing_piece_gen.errors import PipelineError
 
 
 @pytest.fixture()
