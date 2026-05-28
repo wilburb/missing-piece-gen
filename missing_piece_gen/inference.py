@@ -5,6 +5,14 @@ from .errors import InferenceError
 
 _DIRECTIONS = ("top", "right", "bottom", "left")
 
+# The direction label on an EdgeProfile describes which edge of the *surrounding*
+# piece faces the slot.  The missing piece's edge is the opposite side:
+#   - piece above  → its "bottom" edge → constrains missing piece's "top"
+#   - piece below  → its "top" edge    → constrains missing piece's "bottom"
+#   - piece left   → its "right" edge  → constrains missing piece's "left"
+#   - piece right  → its "left" edge   → constrains missing piece's "right"
+_OPPOSITE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
+
 
 def infer_shape(
     edge_profiles: list[EdgeProfile],
@@ -34,8 +42,9 @@ def infer_shape(
     # --- 1. Group profiles by direction (use first per direction) ---
     profiles_by_dir: dict[str, EdgeProfile] = {}
     for ep in edge_profiles:
-        if ep.direction in _DIRECTIONS and ep.direction not in profiles_by_dir:
-            profiles_by_dir[ep.direction] = ep
+        missing_dir = _OPPOSITE.get(ep.direction, ep.direction)
+        if missing_dir in _DIRECTIONS and missing_dir not in profiles_by_dir:
+            profiles_by_dir[missing_dir] = ep
 
     # Estimate piece width/height in pixels from contour extents or hint
     piece_size_px = piece_width_hint_mm / pixel_to_mm_scale
@@ -167,6 +176,7 @@ def _build_edge_segment(
         # Sort by x
         order = np.argsort(x_norm)
         x_norm = x_norm[order]
+        y_dev = y_dev[order]
         y_dev_complement = y_dev_complement[order]
 
         if direction == "top":
@@ -185,7 +195,7 @@ def _build_edge_segment(
             # Edge runs along y=height_px.
             x_pts = x_norm * width_px
             # Travel right → left so we sort descending x
-            y_pts = height_px + y_dev_complement
+            y_pts = height_px + y_dev
             pts = np.column_stack([x_pts, y_pts])
             pts = pts[np.argsort(-pts[:, 0])]
 
@@ -204,12 +214,13 @@ def _build_edge_segment(
 
         order = np.argsort(y_norm)
         y_norm = y_norm[order]
+        x_dev = x_dev[order]
         x_dev_complement = x_dev_complement[order]
 
         if direction == "right":
             # Edge runs along x=width_px; travel top → bottom
             y_pts = y_norm * height_px
-            x_pts = width_px + x_dev_complement
+            x_pts = width_px + x_dev
             pts = np.column_stack([x_pts, y_pts])
             pts = pts[np.argsort(pts[:, 1])]
 
