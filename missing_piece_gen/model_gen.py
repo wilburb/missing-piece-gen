@@ -1,7 +1,7 @@
 """Stage 4: Extrude the 2D missing piece outline into a 3D-printable solid."""
 from pathlib import Path
 import trimesh
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPolygon
 from .models import MissingPieceShape
 from .errors import ModelGenerationError
 
@@ -42,6 +42,10 @@ def generate(
     polygon = Polygon(shape.outline)
     if not polygon.is_valid:
         polygon = polygon.buffer(0)  # fix minor self-intersections
+    # buffer(0) can produce a MultiPolygon when the outline splits into
+    # disconnected regions — take the largest sub-polygon by area.
+    if isinstance(polygon, MultiPolygon):
+        polygon = max(polygon.geoms, key=lambda p: p.area)
     if not polygon.is_valid or polygon.area <= 0:
         raise ModelGenerationError("Invalid 2D outline — cannot create polygon.")
 
