@@ -66,9 +66,10 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
     default=None,
     metavar="<dir>",
     help=(
-        "Directory to write debug images. "
-        "Saves debug_detection.jpg (annotated input with detected pieces/slot/edge types) "
-        "and debug_shape.jpg (inferred 2D outline with edge-type labels)."
+        "Directory to write debug images (default: same directory as --output). "
+        "Saves debug_detection.jpg (annotated input showing detected pieces, slot, and "
+        "per-edge TAB/BLANK/FLAT classifications) and debug_shape.jpg (inferred 2D "
+        "outline with edge-type labels and dimensions)."
     ),
 )
 def main(
@@ -187,24 +188,28 @@ def main(
             f"  Shape: {shape.width_mm:.1f} × {shape.height_mm:.1f} mm"
         )
 
-        # 8. Debug images (optional)
-        if debug_dir is not None:
-            ddir = Path(debug_dir)
-            det_path = debug_viz.save_detection_image(
-                image, pieces, all_edges, ddir / "debug_detection.jpg"
-            )
-            click.echo(f"  Debug detection image: {det_path}")
+        # 8. Debug images — always produced; --debug-dir overrides the directory.
+        # Default: same directory as the output file.
+        ddir = Path(debug_dir) if debug_dir else Path(output).parent
+        det_path = debug_viz.save_detection_image(
+            image, pieces, all_edges, ddir / "debug_detection.jpg"
+        )
+        click.echo(f"  Debug detection image: {det_path}")
 
-            # Build profiles_by_dir for the shape image
-            profiles_by_dir: dict = {}
-            for ep in all_edges:
-                missing_dir = _OPPOSITE.get(ep.direction, ep.direction)
-                if missing_dir not in profiles_by_dir:
-                    profiles_by_dir[missing_dir] = ep
-            shape_path = debug_viz.save_shape_image(
-                shape, profiles_by_dir, ddir / "debug_shape.jpg"
-            )
-            click.echo(f"  Debug shape image:     {shape_path}")
+        # Build profiles_by_dir for the shape image
+        profiles_by_dir: dict = {}
+        for ep in all_edges:
+            missing_dir = _OPPOSITE.get(ep.direction, ep.direction)
+            if missing_dir not in profiles_by_dir:
+                profiles_by_dir[missing_dir] = ep
+        shape_path = debug_viz.save_shape_image(
+            shape, profiles_by_dir, ddir / "debug_shape.jpg"
+        )
+        click.echo(f"  Debug shape image:     {shape_path}")
+
+        edge_paths = debug_viz.save_edge_crops(pieces, all_edges, ddir / "debug_edges")
+        if edge_paths:
+            click.echo(f"  Debug edge crops:      {ddir / 'debug_edges'}/ ({len(edge_paths)} images)")
 
         # 9. Generate and write the 3D model
         click.echo(f"Generating 3D model (format={output_format})...")

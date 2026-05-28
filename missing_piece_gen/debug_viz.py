@@ -221,3 +221,100 @@ def _label_edge(
                   (255, 255, 255), cv2.FILLED)
     cv2.putText(img, label, (lx, ly),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+
+
+def save_edge_crops(
+    pieces: list[PieceRegion],
+    all_edges: list[EdgeProfile],
+    output_dir: str | Path,
+) -> list[Path]:
+    """Save a cropped image for every inward-facing edge showing the ROI that
+    edge_analysis processed, overlaid with the extracted contour points and
+    the detected edge type.
+
+    Files are named: ``piece<id>_<direction>_<edge_type>.jpg``
+
+    Returns a list of paths written.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _ROI_FRAC = 0.30  # must match edge_analysis._EDGE_ROI_FRACTION
+
+    paths: list[Path] = []
+    ep_iter = iter(all_edges)
+    for piece in pieces:
+        for direction in piece.inward_edges:
+            try:
+                ep = next(ep_iter)
+            except StopIteration:
+                break
+
+            if piece.crop is None or piece.crop.size == 0:
+                continue
+
+            crop = piece.crop.copy()
+            h, w = crop.shape[:2]
+
+            # Compute the same ROI slice as edge_analysis
+            frac = _ROI_FRAC
+            if direction == "top":
+                roi_h = max(1, int(h * frac))
+                roi = crop[:roi_h, :]
+            elif direction == "bottom":
+                roi_h = max(1, int(h * frac))
+                roi = crop[h - roi_h:, :]
+            elif direction == "left":
+                roi_w = max(1, int(w * frac))
+                roi = crop[:, :roi_w]
+            elif direction == "right":
+                roi_w = max(1, int(w * frac))
+                roi = crop[:, w - roi_w:]
+            else:
+                roi = crop
+
+            # Scale up small ROIs for visibility
+            min_side = 200
+            rh, rw = roi.shape[:2]
+            scale = max(1, min_side // max(rh, rw, 1))
+            if scale > 1:
+                roi = cv2.resize(roi, (rw * scale, rh * scale),
+                                 interpolation=cv2.INTER_NEAREST)
+
+            # Overlay contour points (translated back to ROI-local coords)
+            if ep.contour is not None and len(ep.contour) >= 2:
+                # Determine the ROI origin in crop coords
+                if direction == "bottom":
+                    roi_y0 = h - max(1, int(h * frac))
+                    roi_x0 = 0
+                elif direction == "right":
+                    roi_x0 = w - max(1, int(w * frac))
+                    roi_y0 = 0
+                else:
+                    roi_x0, roi_y0 = 0, 0
+
+                ct_colour = _EDGE_TYPE_COLOUR.get(ep.edge_type, _BLACK)
+                for pt in ep.contour:
+                    px = int((pt[0] - roi_x0) * scale)
+                    py = int((pt[1] - roi_y0) * scale)
+                    rh_s, rw_s = roi.shape[:2]
+                    if 0 <= px < rw_s and 0 <= py < rh_s:
+                        cv2.circle(roi, (px, py), max(2, scale), ct_colour, -1)
+
+            # Label
+            et_colour = _EDGE_TYPE_COLOUR.get(ep.edge_type, _BLACK)
+            depth_str = (
+                f" d={ep.tab_geometry.depth:.0f}px" if ep.tab_geometry else ""
+            )
+            label = f"#{piece.piece_id} {direction}: {ep.edge_type.value}{depth_str}"
+            cv2.putText(roi, label, (4, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, _WHITE, 2, cv2.LINE_AA)
+            cv2.putText(roi, label, (4, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, et_colour, 1, cv2.LINE_AA)
+
+            fname = f"piece{piece.piece_id}_{direction}_{ep.edge_type.value}.jpg"
+            out_path = output_dir / fname
+            cv2.imwrite(str(out_path), roi)
+            paths.append(out_path)
+
+    return paths
