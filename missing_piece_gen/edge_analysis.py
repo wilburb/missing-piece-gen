@@ -46,7 +46,12 @@ def _extract_single_edge(piece: PieceRegion, direction: str) -> EdgeProfile:
 
     # --- 2. Build piece mask ---
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    # Use Otsu thresholding so the piece/background separation adapts to the
+    # actual intensity distribution in the ROI.  A fixed threshold of 10 made
+    # the entire mask white for any real photo (puzzle pixels are 100-255),
+    # causing findContours to trace the ROI border and yielding zero deviation.
+    blurred_gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blurred_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # Morphological cleanup to remove noise
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
