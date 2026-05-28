@@ -204,7 +204,7 @@ def test_orange_backdrop_detected_when_touching_edges():
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, w = img.shape[:2]
 
-    contour, is_backdrop, msg = _find_orange_backdrop(hsv, w, h)
+    contour, is_backdrop, msg, _cleaned_mask = _find_orange_backdrop(hsv, w, h)
 
     assert contour is not None, f"Expected orange contour to be found; msg={msg!r}"
     assert is_backdrop is True, (
@@ -219,7 +219,7 @@ def test_orange_backdrop_contour_covers_most_of_image():
     h, w = img.shape[:2]
     img_area = float(h * w)
 
-    contour, is_backdrop, _ = _find_orange_backdrop(hsv, w, h)
+    contour, is_backdrop, _, _cleaned_mask = _find_orange_backdrop(hsv, w, h)
 
     assert contour is not None
     assert is_backdrop is True
@@ -512,7 +512,7 @@ def test_calibrate_orange_hsv_overrides_detection():
     img[200:300, 200:300] = (60, 60, 60)
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    contour, is_backdrop, msg = _find_orange_backdrop(hsv, 400, 400, hsv_low=low, hsv_high=high)
+    contour, is_backdrop, msg, _cleaned_mask = _find_orange_backdrop(hsv, 400, 400, hsv_low=low, hsv_high=high)
 
     assert contour is not None, (
         f"Expected a contour with calibrated bounds; msg={msg!r}"
@@ -567,7 +567,7 @@ def test_calibrate_from_ruler_detects_peaks():
     """calibrate_from_ruler returns px/mm close to the known tick spacing.
 
     Creates a synthetic grayscale image with a bright vertical stripe at
-    x=50–110 and regularly-spaced bright horizontal lines every 15px.
+    x=50-110 and regularly-spaced bright horizontal lines every 15px.
     The function should detect the 15px gaps and return a value close to 15.0.
     """
     tick_spacing = 15
@@ -599,7 +599,7 @@ def test_calibrate_from_ruler_too_few_peaks_returns_none():
     width = 200
     img = np.zeros((height, width), dtype=np.uint8)
     img[:, 50:110] = 50
-    # Only 2 tick marks → 1 gap → fewer than 3 usable gaps
+    # Only 2 tick marks -> 1 gap -> fewer than 3 usable gaps
     img[20, 50:110] = 200
     img[35, 50:110] = 200
 
@@ -612,7 +612,7 @@ def test_calibrate_from_ruler_too_few_peaks_returns_none():
 
 def test_calibrate_from_ruler_image_too_narrow():
     """calibrate_from_ruler returns None when the image is narrower than 111px."""
-    # Image with width < 111 — cannot access x=50:110
+    # Image with width < 111 -- cannot access x=50:110
     img = np.zeros((300, 100), dtype=np.uint8)
 
     result = calibrate_from_ruler(img)
@@ -620,3 +620,148 @@ def test_calibrate_from_ruler_image_too_narrow():
     assert result is None, (
         f"Expected None for image width < 111, got {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: issue #38 - overhaul orange segmentation pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestFillHolesMaskStep:
+    """Tests for the binary_fill_holes step in the backdrop pipeline."""
+
+    def test_fill_holes_fills_dark_spot_inside_orange_region(self):
+        """binary_fill_holes fills a small dark hole inside the orange mask.
+
+        Builds a solid binary mask with one 20x20 hole cut out of it.
+        After fill_holes the hole should be gone (all pixels non-zero).
+        """
+        from scipy.ndimage import binary_fill_holes
+
+        # 200x200 solid mask with a 20x20 dark hole in the middle
+        mask = np.full((200, 200), 255, dtype=np.uint8)
+        mask[90:110, 90:110] = 0  # hole
+
+        filled = binary_fill_holes(mask.astype(bool)).astype(np.uint8) * 255
+
+        # The hole should be filled
+        assert filled[95:105, 95:105].min() == 255, (
+            "Dark hole inside the mask should be filled by binary_fill_holes"
+        )
+        # Outer border remains zero (the function only fills enclosed holes)
+        assert filled[0, 0] == 255, "Solid interior region should remain 255"
+
+    def test_fill_holes_does_not_fill_edge_touching_region(self):
+        """binary_fill_holes only fills enclosed holes; edge-connected dark stays dark."""
+        from scipy.ndimage import binary_fill_holes
+
+        # 200x200 mask with a dark strip that touches the top edge (not enclosed)
+        mask = np.full((200, 200), 255, dtype=np.uint8)
+        mask[0:20, 80:120] = 0  # touches top border — not an enclosed hole
+
+        filled = binary_fill_holes(mask.astype(bool)).astype(np.uint8) * 255
+
+        # The top strip is not enclosed, so binary_fill_holes should NOT fill it
+        assert filled[5, 100] == 0, (
+            "Edge-touching dark region must NOT be filled by binary_fill_holes"
+        )
+
+
+class TestLargestBlobSelection:
+    """Tests for the largest-connected-blob selection step (Step A)."""
+
+    def test_largest_blob_kept_smaller_discarded(self):
+        """Only the largest connected blob survives after Step A.
+
+        Creates a mask with two separate orange blobs of different sizes.
+        After connectedComponentsWithStats + selection, only the larger one
+        should remain.
+        """
+        # 400x400 empty mask
+        mask = np.zeros((400, 400), dtype=np.uint8)
+        # Large blob: 200x200 at (50, 50)
+        mask[50:250, 50:250] = 255
+        # Small blob: 30x30 at (300, 300)
+        mask[300:330, 300:330] = 255
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        result = np.where(labels == largest, np.uint8(255), np.uint8(0))
+
+        # Large blob area should be present
+        assert result[150, 150] == 255, "Large blob centre should survive"
+        # Small blob should be gone
+        assert result[315, 315] == 0, "Small blob should be discarded"
+
+    def test_single_blob_unchanged(self):
+        """When there is only one connected component (background + one blob),
+        the mask is unchanged after the largest-blob step."""
+        mask = np.zeros((200, 200), dtype=np.uint8)
+        mask[50:150, 50:150] = 255  # single blob
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n_labels > 1:
+            largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            result = np.where(labels == largest, np.uint8(255), np.uint8(0))
+        else:
+            result = mask.copy()
+
+        assert result[100, 100] == 255, "Single blob should remain"
+        assert np.count_nonzero(result) == np.count_nonzero(mask), (
+            "Single-blob mask should be unchanged"
+        )
+
+
+class TestFindOrangeBackdropReturnsFourTuple:
+    """Verify _find_orange_backdrop always returns a 4-tuple."""
+
+    def test_returns_four_tuple_on_backdrop(self):
+        """_find_orange_backdrop returns a 4-tuple when a backdrop is detected."""
+        img = make_orange_backdrop_image()
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, w = img.shape[:2]
+
+        result = _find_orange_backdrop(hsv, w, h)
+
+        assert len(result) == 4, (
+            f"Expected 4-tuple from _find_orange_backdrop, got {len(result)}-tuple"
+        )
+        contour, is_backdrop, msg, cleaned_mask = result
+        assert contour is not None
+        assert is_backdrop is True
+        # cleaned_mask must be a uint8 array with same spatial shape as the image
+        assert cleaned_mask is not None, "Backdrop path must return a cleaned mask"
+        assert cleaned_mask.shape == (h, w), (
+            f"cleaned_mask shape {cleaned_mask.shape} != image shape {(h, w)}"
+        )
+        assert cleaned_mask.dtype == np.uint8
+
+    def test_returns_four_tuple_no_orange(self):
+        """_find_orange_backdrop returns (None, False, msg, None) when no orange present."""
+        # Gray image with no orange at all
+        img = np.full((300, 300, 3), 128, dtype=np.uint8)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+        result = _find_orange_backdrop(hsv, 300, 300)
+
+        assert len(result) == 4, (
+            f"Expected 4-tuple from _find_orange_backdrop, got {len(result)}-tuple"
+        )
+        contour, is_backdrop, msg, cleaned_mask = result
+        assert contour is None, "No orange image should return None contour"
+        assert is_backdrop is False
+        assert cleaned_mask is None, "No-orange path should return None for cleaned_mask"
+
+    def test_cleaned_mask_is_binary(self):
+        """The cleaned mask returned for a backdrop must contain only 0 and 255."""
+        img = make_orange_backdrop_image()
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, w = img.shape[:2]
+
+        _, _, _, cleaned_mask = _find_orange_backdrop(hsv, w, h)
+
+        assert cleaned_mask is not None
+        unique_vals = np.unique(cleaned_mask)
+        assert set(unique_vals.tolist()).issubset({0, 255}), (
+            f"cleaned_mask must be binary (0/255 only), got unique values: {unique_vals}"
+        )

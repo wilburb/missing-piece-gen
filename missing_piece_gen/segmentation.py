@@ -21,11 +21,11 @@ _PIECE_INTENSITY_OFFSET = 3
 # ---------------------------------------------------------------------------
 # Prusa orange backdrop colour (OpenCV HSV, H: 0–180, S/V: 0–255)
 # Prusa orange ≈ #FA6831 → H 18°, S 80%, V 98%
-# The range below is deliberately wide to handle typical indoor lighting variation.
-# After each run the detected mean HSV is printed so this range can be refined.
+# Tight range: white puzzle backs have low S so they won't bleed into the
+# orange mask.  The --orange-ref calibration path still overrides these.
 # ---------------------------------------------------------------------------
-_ORANGE_HSV_LOW  = np.array([5,  100,  80], dtype=np.uint8)
-_ORANGE_HSV_HIGH = np.array([25, 255, 255], dtype=np.uint8)
+_ORANGE_HSV_LOW  = np.array([ 0, 150, 150], dtype=np.uint8)
+_ORANGE_HSV_HIGH = np.array([20, 255, 255], dtype=np.uint8)
 
 # When orange covers more than this fraction of the total image area it is
 # treated as a full backdrop rather than a small interior slot marker.
@@ -116,7 +116,7 @@ def _find_orange_backdrop(
     img_h: int,
     hsv_low: np.ndarray | None = None,
     hsv_high: np.ndarray | None = None,
-) -> tuple[np.ndarray | None, bool, str]:
+) -> tuple[np.ndarray | None, bool, str, np.ndarray | None]:
     """Detect Prusa orange in the image and determine how it should be used.
 
     Two modes are distinguished:
@@ -124,14 +124,16 @@ def _find_orange_backdrop(
     * **Backdrop mode** – the orange region is dominant (covers more than
       ``_ORANGE_BACKDROP_FRACTION`` of the image area).  In this case the
       orange spans the whole background and its bounding rect will touch the
-      image borders.  The function returns the largest orange contour regardless
-      of border contact and sets ``is_backdrop=True``.  The caller should then
-      find pieces as the non-orange blobs within the frame rather than using
-      intensity thresholding.
+      image borders.  The function applies a multi-step mask cleaning pipeline
+      (largest-blob selection, fill_holes, morph-close, Gaussian blur), extracts
+      and smooths the outer contour, and sets ``is_backdrop=True``.  The caller
+      should then find pieces as the non-orange blobs within the frame.  The
+      cleaned mask is returned as the fourth element so it can be reused by
+      ``_find_piece_contours_by_non_orange``.
 
     * **Slot-marker mode** – a smaller orange region that does NOT touch the
       border, intended as a colour-coded slot marker placed inside the missing
-      slot.  ``is_backdrop=False``.
+      slot.  ``is_backdrop=False``.  The fourth return value is ``None``.
 
     Args:
         hsv:      HSV image.
@@ -143,8 +145,10 @@ def _find_orange_backdrop(
                   ``_ORANGE_HSV_HIGH`` when None.
 
     Returns:
-        (contour_or_None, is_backdrop, status_message)
+        (contour_or_None, is_backdrop, status_message, cleaned_mask_or_None)
     """
+    from scipy.ndimage import binary_fill_holes, gaussian_filter1d
+
     if hsv_low is None:
         hsv_low = _ORANGE_HSV_LOW
     if hsv_high is None:
@@ -163,32 +167,63 @@ def _find_orange_backdrop(
     orange_px = int(np.count_nonzero(mask))
     orange_fraction = orange_px / img_area
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # --- Check if orange fraction qualifies as a backdrop ---
+    if orange_fraction >= _ORANGE_BACKDROP_FRACTION:
+        # Step A: keep largest connected blob
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if n_labels > 1:
+            largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask = np.where(labels == largest, np.uint8(255), np.uint8(0))
 
-    # --- Pass 1: look for a backdrop (large orange region, may touch border) ---
-    backdrop_best: np.ndarray | None = None
-    backdrop_best_area = 0.0
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < _MIN_CONTOUR_AREA:
-            continue
-        # Accept large orange regions even if they touch the image border.
-        if area / img_area >= _ORANGE_BACKDROP_FRACTION:
-            if area > backdrop_best_area:
-                backdrop_best_area = area
-                backdrop_best = c
+        # Save a pre-fill-holes copy for piece detection.  binary_fill_holes fills
+        # any non-orange region that is fully enclosed by orange — including puzzle
+        # pieces on the surface — so piece detection must use the mask before holes
+        # are filled.  The filled mask is used only for contour boundary extraction.
+        piece_detection_mask = mask.copy()
 
-    if backdrop_best is not None:
-        bx, by, bw, bh = cv2.boundingRect(backdrop_best)
+        # Step B: fill_holes pass 1 (fills dark spots/reflections inside orange region)
+        mask = binary_fill_holes(mask.astype(bool)).astype(np.uint8) * 255
+
+        # Step C: morph close (seals thin shadow strips at piece edges)
+        kernel_close2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close2)
+
+        # Step D: fill_holes pass 2 (fills topological ring artifact from morph-close around tabs)
+        mask = binary_fill_holes(mask.astype(bool)).astype(np.uint8) * 255
+
+        # Step E: Gaussian blur mask + re-threshold (smooths staircase boundary)
+        blurred = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigmaX=10, sigmaY=10)
+        mask = (blurred >= 0.5 * 255).astype(np.uint8) * 255
+
+        # Extract contour from cleaned mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return None, False, "  [orange] No backdrop contour after cleanup.", None
+
+        pts = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+        # Periodic Gaussian smooth (closed contour)
+        pts[:, 0] = gaussian_filter1d(pts[:, 0], sigma=3, mode='wrap')
+        pts[:, 1] = gaussian_filter1d(pts[:, 1], sigma=3, mode='wrap')
+        # Subsample to <=800 points
+        n = len(pts)
+        if n > 800:
+            idx = np.round(np.linspace(0, n - 1, 800)).astype(int)
+            pts = pts[idx]
+
+        # Convert back to contour format for cv2 compatibility
+        best = pts.reshape(-1, 1, 2).astype(np.int32)
+        backdrop_best_area = float(cv2.contourArea(best))
+        bx, by, bw, bh = cv2.boundingRect(best)
         msg = (
             f"  [orange] Backdrop detected: "
-            f"bbox=({bx}, {by}, {bw}×{bh} px)  area={backdrop_best_area:.0f} px²  "
+            f"bbox=({bx}, {by}, {bw}x{bh} px)  area={backdrop_best_area:.0f} px2  "
             f"({100 * backdrop_best_area / img_area:.1f}% of image).\n"
             "         Piece detection will use non-orange blob strategy."
         )
-        return backdrop_best, True, msg
+        return best, True, msg, piece_detection_mask
 
     # --- Pass 2: look for a smaller interior slot marker (must not touch border) ---
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     marker_best: np.ndarray | None = None
     marker_best_area = 0.0
     for c in contours:
@@ -211,9 +246,9 @@ def _find_orange_backdrop(
         return None, False, (
             f"  [orange] No orange region found "
             f"(total orange pixels: {orange_px}; fraction={orange_fraction:.3f}; "
-            f"expected HSV {hsv_low.tolist()} – {hsv_high.tolist()}). "
+            f"expected HSV {hsv_low.tolist()} - {hsv_high.tolist()}). "
             "Falling back to dark-region slot detection."
-        )
+        ), None
 
     # Report mean HSV of the detected marker so the user can refine the range.
     sx, sy, sw, sh = cv2.boundingRect(marker_best)
@@ -224,13 +259,13 @@ def _find_orange_backdrop(
 
     msg = (
         f"  [orange] Slot marker detected: "
-        f"bbox=({sx}, {sy}, {sw}×{sh} px)  area={marker_best_area:.0f} px²\n"
+        f"bbox=({sx}, {sy}, {sw}x{sh} px)  area={marker_best_area:.0f} px2\n"
         f"         Detected mean HSV=({mean_h:.0f}, {mean_s:.0f}, {mean_v:.0f})  "
-        f"[range H {hsv_low[0]}–{hsv_high[0]}, "
-        f"S {hsv_low[1]}–{hsv_high[1]}, "
-        f"V {hsv_low[2]}–{hsv_high[2]}]"
+        f"[range H {hsv_low[0]}-{hsv_high[0]}, "
+        f"S {hsv_low[1]}-{hsv_high[1]}, "
+        f"V {hsv_low[2]}-{hsv_high[2]}]"
     )
-    return marker_best, False, msg
+    return marker_best, False, msg, None
 
 
 def _find_slot_contour(
@@ -348,29 +383,36 @@ def _find_piece_contours_by_non_orange(
     img_area: float,
     hsv_low: np.ndarray | None = None,
     hsv_high: np.ndarray | None = None,
+    precomputed_mask: np.ndarray | None = None,
 ) -> list[np.ndarray]:
     """Find piece contours as non-orange blobs within an orange backdrop.
 
     When the background is a uniform Prusa-orange surface, pieces appear as
     non-orange regions.  This function:
-      1. Inverts the orange mask to get a ``non_orange_mask``.
-      2. Applies morphological cleanup to merge fragmented blobs and remove
+      1. Uses the precomputed cleaned mask from ``_find_orange_backdrop`` when
+         available; otherwise rebuilds the mask from HSV via ``cv2.inRange`` and
+         morphological cleanup.
+      2. Inverts the orange mask to get a ``non_orange_mask``.
+      3. Applies morphological cleanup to merge fragmented blobs and remove
          noise from anti-aliased edges.
-      3. Returns contours of blobs that are large enough to be a piece but
+      4. Returns contours of blobs that are large enough to be a piece but
          not so large that they span the whole image.
 
     This avoids the intensity-threshold approach used by ``_find_piece_contours``,
     which would trace every bright internal detail on a piece's surface.
 
     Args:
-        hsv:         HSV image (same size as the original).
-        orange_mask: Binary mask where 255 = orange pixel (after morphological
-                     cleanup; produced by ``_find_orange_backdrop``).
-        img_w:       Image width in pixels.
-        img_h:       Image height in pixels.
-        img_area:    Total image area in pixels² (float).
-        hsv_low:     Lower HSV bound.  Defaults to ``_ORANGE_HSV_LOW``.
-        hsv_high:    Upper HSV bound.  Defaults to ``_ORANGE_HSV_HIGH``.
+        hsv:              HSV image (same size as the original).
+        orange_mask:      Binary mask where 255 = orange pixel (after morphological
+                          cleanup; produced by ``_find_orange_backdrop``).
+        img_w:            Image width in pixels.
+        img_h:            Image height in pixels.
+        img_area:         Total image area in pixels2 (float).
+        hsv_low:          Lower HSV bound.  Defaults to ``_ORANGE_HSV_LOW``.
+        hsv_high:         Upper HSV bound.  Defaults to ``_ORANGE_HSV_HIGH``.
+        precomputed_mask: Pre-cleaned orange mask returned by ``_find_orange_backdrop``
+                          (backdrop path).  When provided, the ``cv2.inRange`` +
+                          morphological cleanup steps are skipped.
 
     Returns:
         List of contour arrays, one per detected non-orange blob.
@@ -380,12 +422,16 @@ def _find_piece_contours_by_non_orange(
     if hsv_high is None:
         hsv_high = _ORANGE_HSV_HIGH
 
-    # Rebuild the clean orange mask from HSV (same pipeline as _find_orange_backdrop).
-    mask = cv2.inRange(hsv, hsv_low, hsv_high)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
+    if precomputed_mask is not None:
+        # Reuse the cleaned mask produced by the backdrop pipeline.
+        mask = precomputed_mask
+    else:
+        # Rebuild the clean orange mask from HSV (same pipeline as _find_orange_backdrop).
+        mask = cv2.inRange(hsv, hsv_low, hsv_high)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open)
 
     # Non-orange pixels are our candidate piece regions.
     non_orange = cv2.bitwise_not(mask)
@@ -431,18 +477,18 @@ def segment(
 
     Slot / backdrop detection strategy (in order):
 
-    1. **Orange backdrop** – if a Prusa-orange region covers >10% of the image
+    1. **Orange backdrop** - if a Prusa-orange region covers >10% of the image
        the entire background is treated as the orange surface.  Piece contours
        are then found as *non-orange* blobs (``_find_piece_contours_by_non_orange``).
        The backdrop contour defines the overall image boundary used for
        ``slot_bounding_box`` context.
 
-    2. **Orange slot marker** – if a smaller orange region that does NOT touch
+    2. **Orange slot marker** - if a smaller orange region that does NOT touch
        the image border is found, it is treated as a colour-coded slot marker
        placed inside the missing slot.  Piece contours are found via intensity
        thresholding (``_find_piece_contours``).
 
-    3. **Dark-region fallback** – largest interior dark contour (Otsu threshold).
+    3. **Dark-region fallback** - largest interior dark contour (Otsu threshold).
        Piece contours are found via intensity thresholding.
 
     Args:
@@ -478,10 +524,11 @@ def segment(
     slot_contour: np.ndarray | None = None
     use_non_orange_piece_detection = False
     hsv: np.ndarray | None = None
+    cleaned_mask: np.ndarray | None = None
 
     if image.ndim == 3:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        orange_contour, is_backdrop, orange_msg = _find_orange_backdrop(
+        orange_contour, is_backdrop, orange_msg, cleaned_mask = _find_orange_backdrop(
             hsv, img_w, img_h,
             hsv_low=orange_hsv_low,
             hsv_high=orange_hsv_high,
@@ -509,7 +556,8 @@ def segment(
 
     # --- Piece detection -----------------------------------------------------
     if use_non_orange_piece_detection:
-        # Build the orange mask for piece detection (HSV already computed above).
+        # Use the cleaned mask from _find_orange_backdrop (backdrop path) so the
+        # expensive pipeline (fill_holes, morph-close, Gaussian blur) runs only once.
         _low  = orange_hsv_low  if orange_hsv_low  is not None else _ORANGE_HSV_LOW
         _high = orange_hsv_high if orange_hsv_high is not None else _ORANGE_HSV_HIGH
         orange_mask = cv2.inRange(hsv, _low, _high)
@@ -517,6 +565,7 @@ def segment(
             hsv, orange_mask, img_w, img_h, img_area,
             hsv_low=orange_hsv_low,
             hsv_high=orange_hsv_high,
+            precomputed_mask=cleaned_mask,
         )
     else:
         # Build a filled slot mask to exclude the slot area from piece detection.
