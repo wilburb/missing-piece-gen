@@ -143,7 +143,9 @@ def _filter_edge_points(
     'Near' is defined as the outermost 40% of the crop along the
     perpendicular axis.
     """
-    frac = 0.40
+    # Keep only points in the outer 20% of the crop (inside the 30% ROI band).
+    # The old 40% threshold was wider than the ROI, so nothing was filtered.
+    frac = 0.20
     if direction == "top":
         threshold = h * frac
         mask = pts[:, 1] <= threshold
