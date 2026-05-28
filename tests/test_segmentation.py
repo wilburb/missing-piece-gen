@@ -6,6 +6,7 @@ import pytest
 from missing_piece_gen.segmentation import (
     segment,
     calibrate_orange_hsv,
+    calibrate_from_ruler,
     _find_orange_backdrop,
     _find_piece_contours_by_non_orange,
     _ORANGE_HSV_LOW,
@@ -555,3 +556,67 @@ def test_segment_uses_custom_hsv_bounds():
     for region in regions:
         assert isinstance(region, PieceRegion)
         assert region.slot_bounding_box is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests: calibrate_from_ruler (issue #39)
+# ---------------------------------------------------------------------------
+
+
+def test_calibrate_from_ruler_detects_peaks():
+    """calibrate_from_ruler returns px/mm close to the known tick spacing.
+
+    Creates a synthetic grayscale image with a bright vertical stripe at
+    x=50–110 and regularly-spaced bright horizontal lines every 15px.
+    The function should detect the 15px gaps and return a value close to 15.0.
+    """
+    tick_spacing = 15
+    height = 400
+    width = 200
+    # Dark background
+    img = np.zeros((height, width), dtype=np.uint8)
+    # Bright stripe in the ruler column range
+    img[:, 50:110] = 50
+    # Add bright horizontal tick marks every tick_spacing pixels
+    for y in range(0, height, tick_spacing):
+        img[y, 50:110] = 200
+
+    result = calibrate_from_ruler(img)
+
+    assert result is not None, "Expected a float result for a well-spaced ruler image"
+    assert abs(result - tick_spacing) < 2.0, (
+        f"Expected px/mm close to {tick_spacing}, got {result:.2f}"
+    )
+
+
+def test_calibrate_from_ruler_too_few_peaks_returns_none():
+    """calibrate_from_ruler returns None when fewer than 3 usable gaps are found.
+
+    Creates a profile with only 2 bright lines (yielding 1 gap), which is
+    below the minimum of 3 gaps required to return a calibration value.
+    """
+    height = 200
+    width = 200
+    img = np.zeros((height, width), dtype=np.uint8)
+    img[:, 50:110] = 50
+    # Only 2 tick marks → 1 gap → fewer than 3 usable gaps
+    img[20, 50:110] = 200
+    img[35, 50:110] = 200
+
+    result = calibrate_from_ruler(img)
+
+    assert result is None, (
+        f"Expected None for profile with only 2 peaks, got {result!r}"
+    )
+
+
+def test_calibrate_from_ruler_image_too_narrow():
+    """calibrate_from_ruler returns None when the image is narrower than 111px."""
+    # Image with width < 111 — cannot access x=50:110
+    img = np.zeros((300, 100), dtype=np.uint8)
+
+    result = calibrate_from_ruler(img)
+
+    assert result is None, (
+        f"Expected None for image width < 111, got {result!r}"
+    )

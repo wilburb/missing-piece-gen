@@ -82,6 +82,12 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
         "image instead of using the built-in defaults."
     ),
 )
+@click.option(
+    "--ruler",
+    is_flag=True,
+    default=False,
+    help="Detect a mm ruler in the image for accurate px/mm scale calibration.",
+)
 def main(
     image_path: str,
     output: str,
@@ -91,6 +97,7 @@ def main(
     piece_width_mm: float,
     debug_dir: str | None,
     orange_ref: str | None,
+    ruler: bool,
 ) -> None:
     """Generate a 3D-printable missing puzzle piece from IMAGE_PATH.
 
@@ -134,12 +141,27 @@ def main(
                     f"{low.tolist()} – {high.tolist()}"
                 )
 
-        # 4. Segment surrounding pieces
+        # 4. Optional: calibrate px/mm scale from a ruler visible in the image
+        ruler_px_per_mm: float | None = None
+        if ruler:
+            gray_for_ruler = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            px_per_mm = segmentation.calibrate_from_ruler(gray_for_ruler)
+            if px_per_mm is not None:
+                click.echo(f"  [ruler] Calibrated: {px_per_mm:.1f} px/mm")
+                ruler_px_per_mm = px_per_mm
+            else:
+                click.echo(
+                    "  [ruler] Warning: could not detect ruler ticks, "
+                    "falling back to --piece-width-mm",
+                    err=True,
+                )
+
+        # 5. Segment surrounding pieces
         click.echo("Detecting missing region...")
         pieces = segmentation.segment(image, orange_hsv_low=orange_hsv_low, orange_hsv_high=orange_hsv_high)
         click.echo(f"  Found {len(pieces)} surrounding piece(s).")
 
-        # 5. Extract edge profiles for each piece
+        # 6. Extract edge profiles for each piece
         click.echo("Extracting edge profiles...")
         all_edges = []
         for piece in pieces:
@@ -155,7 +177,9 @@ def main(
                     f"→ {ep.edge_type.value}{depth_str}"
                 )
 
-        # 6. Compute pixel-to-mm scale from the average bounding-box width of pieces.
+        # 7. Compute pixel-to-mm scale.
+        #    When --ruler was used and calibration succeeded, use the ruler value directly.
+        #    Otherwise fall back to the piece-width-mm estimation approach.
         widths_px = []
         for piece in pieces:
             if piece.bounding_polygon is not None and len(piece.bounding_polygon) >= 2:
@@ -163,13 +187,22 @@ def main(
                 if w > 0:
                     widths_px.append(w)
         avg_piece_width_px = float(np.mean(widths_px)) if widths_px else _FALLBACK_PIECE_WIDTH_PX
-        pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
-        click.echo(
-            f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
-            f"(avg piece width {avg_piece_width_px:.0f} px = {piece_width_mm:.1f} mm)"
-        )
 
-        # 7. Estimate slot dimensions from the surrounding pieces themselves.
+        if ruler and ruler_px_per_mm is not None:
+            scale_px_per_mm = ruler_px_per_mm
+            pixel_to_mm_scale = 1.0 / scale_px_per_mm
+            click.echo(
+                f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
+                f"(ruler calibration: {scale_px_per_mm:.1f} px/mm)"
+            )
+        else:
+            pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
+            click.echo(
+                f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
+                f"(avg piece width {avg_piece_width_px:.0f} px = {piece_width_mm:.1f} mm)"
+            )
+
+        # 8. Estimate slot dimensions from the surrounding pieces themselves.
         #
         # The slot bounding box from segmentation is unreliable in real photos
         # (shadows, dark artwork, or background can be detected instead of the gap).
@@ -207,7 +240,7 @@ def main(
                 f"{slot_height_px * pixel_to_mm_scale:.1f} mm"
             )
 
-        # 8. Infer the missing piece shape
+        # 9. Infer the missing piece shape
         click.echo("Inferring missing piece shape...")
         shape = inference.infer_shape(
             all_edges,
@@ -219,7 +252,7 @@ def main(
             f"  Shape: {shape.width_mm:.1f} × {shape.height_mm:.1f} mm"
         )
 
-        # 9. Debug images — always produced; --debug-dir overrides the directory.
+        # 10. Debug images — always produced; --debug-dir overrides the directory.
         # Default: same directory as the output file.
         ddir = Path(debug_dir) if debug_dir else Path(output).parent
         det_path = debug_viz.save_detection_image(
@@ -242,7 +275,7 @@ def main(
         if edge_paths:
             click.echo(f"  Debug edge crops:      {ddir / 'debug_edges'}/ ({len(edge_paths)} images)")
 
-        # 10. Generate and write the 3D model
+        # 11. Generate and write the 3D model
         click.echo(f"Generating 3D model (format={output_format})...")
         model_gen.generate(
             shape,
@@ -252,7 +285,7 @@ def main(
             bevel_mm=bevel,
         )
 
-        # 11. Success
+        # 12. Success
         click.echo(f"Done. Output written to: {output}")
 
     except PipelineError as exc:

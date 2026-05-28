@@ -80,6 +80,36 @@ def calibrate_orange_hsv(
     return low, high
 
 
+def calibrate_from_ruler(gray: np.ndarray) -> float | None:
+    """Detect a mm ruler in the image and return px/mm scale.
+
+    Scans a vertical strip at x=50–110px, collapses horizontally to a
+    1D brightness profile, finds tick-mark peaks, filters to gaps < 25px
+    (the 1mm ticks), and returns the mean gap (px/mm).
+
+    Returns None if fewer than 3 usable gaps are found.
+    """
+    from scipy.signal import find_peaks
+
+    if gray.shape[1] < 111:
+        return None
+
+    strip = gray[:, 50:110]
+    profile = strip.mean(axis=1).astype(np.float32)
+
+    peaks, _ = find_peaks(profile, distance=5)
+    if len(peaks) < 2:
+        return None
+
+    gaps = np.diff(peaks.astype(float))
+    mm_gaps = gaps[gaps < 25]
+
+    if len(mm_gaps) < 3:
+        return None
+
+    return float(mm_gaps.mean())
+
+
 def _find_orange_backdrop(
     hsv: np.ndarray,
     img_w: int,
