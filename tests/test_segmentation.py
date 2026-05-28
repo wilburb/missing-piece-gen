@@ -5,6 +5,7 @@ import pytest
 
 from missing_piece_gen.segmentation import (
     segment,
+    calibrate_orange_hsv,
     _find_orange_backdrop,
     _find_piece_contours_by_non_orange,
     _ORANGE_HSV_LOW,
@@ -448,3 +449,109 @@ class TestBorderTouchingBlobFilter:
         assert len(contours) >= 1, (
             "A 100×100 interior non-orange blob must not be filtered by the border-touch guard"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: calibrate_orange_hsv and --orange-ref integration (issue #36)
+# ---------------------------------------------------------------------------
+
+
+def test_calibrate_orange_hsv_basic():
+    """calibrate_orange_hsv returns valid uint8 arrays with low[i] <= high[i].
+
+    Creates a solid Prusa-orange BGR image and verifies that the returned
+    (low, high) pair satisfies the contract: all values are within the valid
+    OpenCV HSV range and the lower bound never exceeds the upper bound.
+    """
+    # Prusa orange BGR: (49, 104, 250)
+    orange_bgr = np.full((100, 100, 3), (49, 104, 250), dtype=np.uint8)
+    low, high = calibrate_orange_hsv(orange_bgr)
+
+    assert low.dtype == np.uint8, "low should be uint8"
+    assert high.dtype == np.uint8, "high should be uint8"
+    assert low.shape == (3,), "low should be a 1-D array of length 3"
+    assert high.shape == (3,), "high should be a 1-D array of length 3"
+
+    # H channel: 0–180
+    assert 0 <= int(low[0]) <= 180, f"low H={low[0]} out of range"
+    assert 0 <= int(high[0]) <= 180, f"high H={high[0]} out of range"
+    # S and V channels: 0–255
+    for i in (1, 2):
+        assert 0 <= int(low[i]) <= 255, f"low[{i}]={low[i]} out of range"
+        assert 0 <= int(high[i]) <= 255, f"high[{i}]={high[i]} out of range"
+
+    # low[i] must not exceed high[i] for any channel
+    for i in range(3):
+        assert int(low[i]) <= int(high[i]), (
+            f"low[{i}]={low[i]} > high[{i}]={high[i]}"
+        )
+
+
+def test_calibrate_orange_hsv_overrides_detection():
+    """Calibrated bounds from a reddish-orange reference allow _find_orange_backdrop
+    to detect a non-standard orange that the built-in range would miss.
+
+    Uses a reddish-orange with H≈3 (well below the built-in lower bound of H=5)
+    as the backdrop and verifies that _find_orange_backdrop finds it when supplied
+    with the calibrated bounds.
+    """
+    # Reddish-orange: H≈3 in OpenCV (6° in degrees).
+    # BGR equivalent for HSV (3, 220, 230): approximately (38, 38, 230) in BGR.
+    # Use cv2 to construct a precise HSV→BGR conversion.
+    hsv_ref = np.full((100, 100, 3), (3, 220, 230), dtype=np.uint8)
+    bgr_ref = cv2.cvtColor(hsv_ref, cv2.COLOR_HSV2BGR)
+
+    # The built-in range (H 5–25) may miss H=3.  Calibrate from the reference.
+    low, high = calibrate_orange_hsv(bgr_ref)
+
+    # Build a 400×400 backdrop image using the same reddish-orange.
+    img = np.full((400, 400, 3), bgr_ref[0, 0].tolist(), dtype=np.uint8)
+    # Place two dark pieces on it so it qualifies as a backdrop (> 10% orange).
+    img[50:150, 50:150] = (60, 60, 60)
+    img[200:300, 200:300] = (60, 60, 60)
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    contour, is_backdrop, msg = _find_orange_backdrop(hsv, 400, 400, hsv_low=low, hsv_high=high)
+
+    assert contour is not None, (
+        f"Expected a contour with calibrated bounds; msg={msg!r}"
+    )
+    assert is_backdrop is True, (
+        f"Expected is_backdrop=True for a full reddish-orange canvas; msg={msg!r}"
+    )
+
+
+def test_segment_uses_custom_hsv_bounds():
+    """segment() passes custom HSV bounds through to orange detection.
+
+    Constructs a reddish-orange backdrop image and verifies that segment()
+    succeeds when supplied with calibrated bounds derived from a reference image
+    of the same colour.  Without calibration the pipeline would fall back to
+    dark-region detection (or raise DetectionError).
+    """
+    # Same reddish-orange as above (H≈3).
+    hsv_ref = np.full((100, 100, 3), (3, 220, 230), dtype=np.uint8)
+    bgr_ref = cv2.cvtColor(hsv_ref, cv2.COLOR_HSV2BGR)
+    ref_color = bgr_ref[0, 0].tolist()
+
+    low, high = calibrate_orange_hsv(bgr_ref)
+
+    # Build a 400×400 backdrop with two large interior non-orange pieces.
+    img = np.full((400, 400, 3), ref_color, dtype=np.uint8)
+    img[30:180, 30:180] = (60, 60, 60)   # left piece (well inside the frame)
+    img[30:180, 220:370] = (60, 60, 60)  # right piece (well inside the frame)
+
+    # Add a fine noise pattern to raise the Laplacian variance above the blur
+    # threshold so _check_blur does not reject this synthetic image.
+    rng = np.random.default_rng(42)
+    noise = rng.integers(-10, 11, size=img.shape, dtype=np.int16)
+    img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    regions = segment(img, orange_hsv_low=low, orange_hsv_high=high)
+
+    assert len(regions) >= 1, (
+        "segment() with calibrated bounds should detect pieces on a reddish-orange backdrop"
+    )
+    for region in regions:
+        assert isinstance(region, PieceRegion)
+        assert region.slot_bounding_box is not None
