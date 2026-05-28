@@ -10,6 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "build123d>=0.8",
     "trimesh>=4.0",
+    "shapely>=2.0",
+    "mapbox-earcut>=1.0",
     "numpy>=1.24",
     "click>=8.0",
     "opencv-python>=4.8",
