@@ -44,8 +44,19 @@ def _extract_single_edge(piece: PieceRegion, direction: str) -> EdgeProfile:
     # --- 1. Isolate edge region of interest ---
     roi, roi_offset = _get_edge_roi(crop, direction, h, w)
 
+    # Guard: if the ROI is too small for the GaussianBlur (5,5) kernel, return
+    # a flat edge immediately rather than letting OpenCV raise a C++ exception.
+    if roi.shape[0] < 5 or roi.shape[1] < 5:
+        return EdgeProfile(
+            direction=direction,
+            contour=np.empty((0, 2), dtype=np.float32),
+            edge_type=EdgeType.FLAT,
+            tab_geometry=None,
+        )
+
     # --- 2. Build piece mask ---
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # Use .copy() to guarantee a C-contiguous array before passing to OpenCV.
+    gray = cv2.cvtColor(roi.copy(), cv2.COLOR_BGR2GRAY)
     # Use Otsu thresholding so the piece/background separation adapts to the
     # actual intensity distribution in the ROI.  A fixed threshold of 10 made
     # the entire mask white for any real photo (puzzle pixels are 100-255),

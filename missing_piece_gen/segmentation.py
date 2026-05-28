@@ -309,10 +309,16 @@ def _find_piece_contours_by_non_orange(
 
     # Use a size-relative lower bound: at least 0.05% of image area.
     min_area = max(_MIN_CONTOUR_AREA, img_area * 0.0005)
-    return [
-        c for c in contours
-        if min_area <= cv2.contourArea(c) <= _MAX_CONTOUR_AREA_FRACTION * img_area
-    ]
+    valid = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (min_area <= area <= _MAX_CONTOUR_AREA_FRACTION * img_area):
+            continue
+        _, _, bw, bh = cv2.boundingRect(c)
+        if bw < 20 or bh < 20:
+            continue
+        valid.append(c)
+    return valid
 
 
 def segment(image: np.ndarray) -> list[PieceRegion]:

@@ -4,7 +4,7 @@ import cv2
 import pytest
 
 from missing_piece_gen.models import PieceRegion, EdgeType
-from missing_piece_gen.edge_analysis import extract_edges
+from missing_piece_gen.edge_analysis import extract_edges, _extract_single_edge
 from missing_piece_gen.errors import EdgeExtractionError
 
 
@@ -226,6 +226,59 @@ class TestTabGeometry:
         for p in profiles:
             if p.tab_geometry is not None:
                 assert p.tab_geometry.depth > 0
+
+
+class TestDegenerateCropGuard:
+    """Regression tests for issue #32: degenerate/tiny crops must not crash."""
+
+    def test_crop_smaller_than_5px_height_returns_flat(self):
+        """A crop with height < 5px must return FLAT without crashing (issue #32).
+
+        Verifies the guard added to _extract_single_edge that rejects ROIs too
+        small for cv2.GaussianBlur's (5,5) kernel.
+        """
+        # 3px tall × 100px wide — the 'bottom' ROI will be 1-2px tall
+        crop = np.ones((3, 100, 3), dtype=np.uint8) * 200
+        piece = PieceRegion(
+            piece_id=50,
+            crop=crop,
+            bounding_polygon=np.array([[0, 0], [100, 0], [100, 3], [0, 3]]),
+            inward_edges=["bottom"],
+            slot_bounding_box=(0, 0, 100, 10),
+        )
+        profiles = extract_edges(piece)
+        assert len(profiles) == 1
+        assert profiles[0].edge_type == EdgeType.FLAT
+
+    def test_crop_smaller_than_5px_width_returns_flat(self):
+        """A crop with width < 5px must return FLAT without crashing (issue #32)."""
+        # 100px tall × 3px wide — the 'right' ROI will be 1-2px wide
+        crop = np.ones((100, 3, 3), dtype=np.uint8) * 200
+        piece = PieceRegion(
+            piece_id=51,
+            crop=crop,
+            bounding_polygon=np.array([[0, 0], [3, 0], [3, 100], [0, 100]]),
+            inward_edges=["right"],
+            slot_bounding_box=(0, 0, 10, 100),
+        )
+        profiles = extract_edges(piece)
+        assert len(profiles) == 1
+        assert profiles[0].edge_type == EdgeType.FLAT
+
+    def test_tiny_crop_all_directions_no_crash(self):
+        """A 4×4 crop must not crash for any inward edge direction (issue #32)."""
+        crop = np.ones((4, 4, 3), dtype=np.uint8) * 180
+        for direction in ["top", "bottom", "left", "right"]:
+            piece = PieceRegion(
+                piece_id=52,
+                crop=crop,
+                bounding_polygon=np.array([[0, 0], [4, 0], [4, 4], [0, 4]]),
+                inward_edges=[direction],
+                slot_bounding_box=(0, 0, 10, 10),
+            )
+            profiles = extract_edges(piece)
+            assert len(profiles) == 1
+            assert profiles[0].edge_type == EdgeType.FLAT
 
 
 class TestEdgeDirectionVariants:
