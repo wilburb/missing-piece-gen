@@ -6,6 +6,7 @@ import pytest
 from missing_piece_gen.segmentation import (
     segment,
     _find_orange_backdrop,
+    _find_piece_contours_by_non_orange,
     _ORANGE_HSV_LOW,
     _ORANGE_HSV_HIGH,
 )
@@ -271,4 +272,94 @@ def test_segment_orange_backdrop_piece_crop_is_not_orange():
         assert orange_fraction < 0.5, (
             f"Piece crop (id={region.piece_id}) is >50% orange "
             f"({orange_fraction:.2%}); the backdrop was likely detected as a piece."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: thin sliver filter in _find_piece_contours_by_non_orange (issue #32)
+# ---------------------------------------------------------------------------
+
+
+def _make_orange_hsv_image(width: int, height: int) -> np.ndarray:
+    """Return an HSV image filled entirely with Prusa orange."""
+    bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+
+class TestThinSliverFilter:
+    """Regression tests for issue #32: thin border slivers must be rejected."""
+
+    def test_thin_horizontal_sliver_is_filtered_out(self):
+        """A sliver blob < 20px tall must be rejected even if its area passes the filter.
+
+        Simulates the 3px tall × 1500px wide non-orange strip that used to
+        pass the area check in _find_piece_contours_by_non_orange, leading to a
+        degenerate crop and an 'Unknown C++ exception' from cv2.GaussianBlur.
+        """
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        # Build an image that is entirely Prusa orange except for a very thin
+        # horizontal strip near the top (3 px tall × full width = 1200 px² area,
+        # which exceeds _MIN_CONTOUR_AREA=2000 when scaled, but we use a wider
+        # strip to guarantee it passes area while still being < 20px tall).
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # Insert a 10px tall × 400px wide non-orange strip at the top edge.
+        # Area = 10 * 400 = 4000 px² — above _MIN_CONTOUR_AREA=2000.
+        bgr[0:10, :] = (60, 60, 60)  # dark gray (non-orange)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        # The 10px-tall sliver must be filtered out (bh < 20px).
+        for c in contours:
+            _, _, bw, bh = cv2.boundingRect(c)
+            assert bw >= 20 and bh >= 20, (
+                f"Thin sliver with bounding rect {bw}×{bh} should have been filtered out"
+            )
+
+    def test_thin_vertical_sliver_is_filtered_out(self):
+        """A sliver blob < 20px wide must be rejected (issue #32)."""
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # Insert a 10px wide × 400px tall non-orange strip on the left edge.
+        bgr[:, 0:10] = (60, 60, 60)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        for c in contours:
+            _, _, bw, bh = cv2.boundingRect(c)
+            assert bw >= 20 and bh >= 20, (
+                f"Thin sliver with bounding rect {bw}×{bh} should have been filtered out"
+            )
+
+    def test_valid_piece_blob_is_not_filtered_out(self):
+        """A blob >= 20px in both dimensions must NOT be filtered out."""
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # Insert a 100×100 non-orange piece well inside the frame.
+        bgr[50:150, 50:150] = (60, 60, 60)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        assert len(contours) >= 1, (
+            "A 100×100 non-orange blob should not be filtered out by the dimension check"
         )
