@@ -314,8 +314,18 @@ def _find_piece_contours_by_non_orange(
         area = cv2.contourArea(c)
         if not (min_area <= area <= _MAX_CONTOUR_AREA_FRACTION * img_area):
             continue
-        _, _, bw, bh = cv2.boundingRect(c)
+        bx, by, bw, bh = cv2.boundingRect(c)
         if bw < 20 or bh < 20:
+            continue
+        # Real puzzle pieces placed on the orange backdrop are completely
+        # surrounded by orange and never touch the image border.
+        # Border-touching blobs (border strips, shadows at edges) are NOT pieces.
+        touches_edge = (
+            bx <= 1 or by <= 1
+            or bx + bw >= img_w - 1
+            or by + bh >= img_h - 1
+        )
+        if touches_edge:
             continue
         valid.append(c)
     return valid

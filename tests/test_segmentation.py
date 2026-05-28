@@ -363,3 +363,88 @@ class TestThinSliverFilter:
         assert len(contours) >= 1, (
             "A 100×100 non-orange blob should not be filtered out by the dimension check"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: border-touching blob filter in _find_piece_contours_by_non_orange
+# (issue #34)
+# ---------------------------------------------------------------------------
+
+
+class TestBorderTouchingBlobFilter:
+    """Regression tests for issue #34: blobs touching the image border must be rejected."""
+
+    def test_border_touching_blob_is_filtered_out(self):
+        """A non-orange blob that touches the image border must be rejected.
+
+        Real puzzle pieces on an orange backdrop are completely surrounded by
+        orange and never touch the image border.  Border-touching blobs (border
+        strips, shadows at edges) are noise and must be excluded.
+        """
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        # Orange backdrop with a large non-orange blob that starts at x=0 (touches left edge).
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # 100×200 dark blob anchored at the left border (bx=0).
+        bgr[100:300, 0:100] = (60, 60, 60)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        # The border-touching blob must be rejected.
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            assert bx > 1 and by > 1, (
+                f"Border-touching blob at bx={bx}, by={by} should have been filtered out"
+            )
+            assert bx + bw < width - 1 and by + bh < height - 1, (
+                f"Border-touching blob reaching bx+bw={bx+bw}, by+bh={by+bh} "
+                f"should have been filtered out (img {width}×{height})"
+            )
+
+    def test_border_touching_top_blob_is_filtered_out(self):
+        """A non-orange blob touching the top border is rejected (issue #34)."""
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # 400×50 dark strip at the very top (by=0).
+        bgr[0:50, :] = (60, 60, 60)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            assert by > 1, (
+                f"Border-touching blob at by={by} should have been filtered out"
+            )
+
+    def test_interior_blob_is_not_filtered_out(self):
+        """A non-orange blob fully interior (not touching any edge) must NOT be rejected."""
+        width, height = 400, 400
+        img_area = float(width * height)
+
+        bgr = np.full((height, width, 3), (49, 104, 250), dtype=np.uint8)
+        # 100×100 dark blob fully inside the frame (at least 5px from every edge).
+        bgr[50:150, 50:150] = (60, 60, 60)
+
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        orange_mask = cv2.inRange(hsv, _ORANGE_HSV_LOW, _ORANGE_HSV_HIGH)
+
+        contours = _find_piece_contours_by_non_orange(
+            hsv, orange_mask, width, height, img_area
+        )
+
+        assert len(contours) >= 1, (
+            "A 100×100 interior non-orange blob must not be filtered by the border-touch guard"
+        )

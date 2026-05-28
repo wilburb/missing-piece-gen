@@ -322,3 +322,101 @@ class TestEdgeDirectionVariants:
         profiles = extract_edges(piece)
         assert len(profiles) == 1
         assert isinstance(profiles[0].edge_type, EdgeType)
+
+
+class TestGaussianBlurFallback:
+    """Tests for issue #34: GaussianBlur/threshold failure returns EdgeType.FLAT.
+
+    On Windows, certain row widths cause OpenCV's SIMD path to throw
+    "Unknown C++ exception" inside cv2.GaussianBlur or cv2.threshold.
+    The try/except guard added in _extract_single_edge must catch this and
+    return a FLAT EdgeProfile rather than propagating the exception.
+    """
+
+    def test_gaussianblur_exception_returns_flat(self, monkeypatch):
+        """Simulate a GaussianBlur crash; _extract_single_edge must return FLAT."""
+        import missing_piece_gen.edge_analysis as ea
+
+        def _mock_gaussian_blur(*args, **kwargs):
+            raise RuntimeError("Unknown C++ exception from OpenCV SIMD path")
+
+        monkeypatch.setattr(cv2, "GaussianBlur", _mock_gaussian_blur)
+
+        crop = np.ones((100, 100, 3), dtype=np.uint8) * 200
+        piece = PieceRegion(
+            piece_id=60,
+            crop=crop,
+            bounding_polygon=np.array([[0, 0], [100, 0], [100, 100], [0, 100]]),
+            inward_edges=["top"],
+            slot_bounding_box=(0, 0, 100, 100),
+        )
+
+        profiles = extract_edges(piece)
+        assert len(profiles) == 1
+        assert profiles[0].edge_type == EdgeType.FLAT
+        assert profiles[0].direction == "top"
+        assert profiles[0].tab_geometry is None
+
+    def test_threshold_exception_returns_flat(self, monkeypatch):
+        """Simulate a cv2.threshold crash; _extract_single_edge must return FLAT."""
+        import missing_piece_gen.edge_analysis as ea
+
+        def _mock_threshold(*args, **kwargs):
+            raise RuntimeError("Unknown C++ exception from OpenCV SIMD path")
+
+        monkeypatch.setattr(cv2, "threshold", _mock_threshold)
+
+        crop = np.ones((100, 100, 3), dtype=np.uint8) * 200
+        piece = PieceRegion(
+            piece_id=61,
+            crop=crop,
+            bounding_polygon=np.array([[0, 0], [100, 0], [100, 100], [0, 100]]),
+            inward_edges=["right"],
+            slot_bounding_box=(0, 0, 100, 100),
+        )
+
+        profiles = extract_edges(piece)
+        assert len(profiles) == 1
+        assert profiles[0].edge_type == EdgeType.FLAT
+        assert profiles[0].direction == "right"
+
+    def test_normal_operation_not_affected(self):
+        """When OpenCV works normally, _extract_single_edge must behave as before."""
+        crop = np.zeros((100, 100, 3), dtype=np.uint8)
+        cv2.rectangle(crop, (5, 5), (95, 95), (255, 255, 255), -1)
+        piece = PieceRegion(
+            piece_id=62,
+            crop=crop,
+            bounding_polygon=np.array([[5, 5], [95, 5], [95, 95], [5, 95]]),
+            inward_edges=["top"],
+            slot_bounding_box=(0, 0, 100, 100),
+        )
+
+        profiles = extract_edges(piece)
+        assert len(profiles) == 1
+        assert isinstance(profiles[0].edge_type, EdgeType)
+        # Normal operation must not return a contour-less FLAT from the exception path
+        # (it may legitimately be FLAT, but the function should complete normally).
+
+    def test_gaussianblur_exception_all_directions(self, monkeypatch):
+        """The try/except fallback works for all four edge directions."""
+
+        def _mock_gaussian_blur(*args, **kwargs):
+            raise Exception("SIMD crash")
+
+        monkeypatch.setattr(cv2, "GaussianBlur", _mock_gaussian_blur)
+
+        crop = np.ones((100, 100, 3), dtype=np.uint8) * 200
+        for direction in ["top", "bottom", "left", "right"]:
+            piece = PieceRegion(
+                piece_id=63,
+                crop=crop,
+                bounding_polygon=np.array([[0, 0], [100, 0], [100, 100], [0, 100]]),
+                inward_edges=[direction],
+                slot_bounding_box=(0, 0, 100, 100),
+            )
+            profiles = extract_edges(piece)
+            assert len(profiles) == 1
+            assert profiles[0].edge_type == EdgeType.FLAT, (
+                f"Expected FLAT for direction={direction!r} when GaussianBlur raises"
+            )
