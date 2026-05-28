@@ -123,6 +123,26 @@ def test_bevel_param_accepted():
         assert out.exists() and out.stat().st_size > 0
 
 
+def test_multipolygon_outline_does_not_raise():
+    """Regression for #22: buffer(0) producing MultiPolygon must not crash.
+
+    A self-intersecting outline (figure-8) triggers buffer(0) → MultiPolygon.
+    The fix selects the largest sub-polygon by area and extrudes it.
+    """
+    # Figure-8 outline: two triangles sharing a single crossing point
+    outline = np.array([
+        [0.0, 0.0], [10.0, 10.0], [10.0, 0.0],   # triangle 1
+        [0.0, 10.0], [0.0, 0.0],                   # back to start via crossing
+    ], dtype=float)
+    shape = MissingPieceShape(outline=outline, width_mm=10.0, height_mm=10.0,
+                              pixel_to_mm_scale=1.0)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "multipolygon.stl"
+        # Should not raise AttributeError: 'MultiPolygon' object has no attribute 'exterior'
+        generate(shape, out, format="stl")
+        assert out.exists() and out.stat().st_size > 0
+
+
 def test_thickness_applied():
     """The extruded mesh height matches the requested thickness_mm."""
     thickness = 6.0
