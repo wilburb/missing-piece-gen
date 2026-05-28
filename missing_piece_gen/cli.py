@@ -72,6 +72,16 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
         "outline with edge-type labels and dimensions)."
     ),
 )
+@click.option(
+    "--orange-ref",
+    default=None,
+    metavar="<path>",
+    help=(
+        "Path to a reference photo of just the orange backdrop. "
+        "When supplied, the tool auto-calibrates the HSV detection range from that "
+        "image instead of using the built-in defaults."
+    ),
+)
 def main(
     image_path: str,
     output: str,
@@ -80,6 +90,7 @@ def main(
     bevel: float,
     piece_width_mm: float,
     debug_dir: str | None,
+    orange_ref: str | None,
 ) -> None:
     """Generate a 3D-printable missing puzzle piece from IMAGE_PATH.
 
@@ -103,12 +114,32 @@ def main(
                 "Ensure the file is a supported image format."
             )
 
-        # 3. Segment surrounding pieces
+        # 3. Optional: calibrate orange HSV range from a reference photo
+        orange_hsv_low = None
+        orange_hsv_high = None
+        if orange_ref is not None:
+            ref_image = cv2.imread(orange_ref)
+            if ref_image is None:
+                click.echo(
+                    f"Warning: could not read orange-ref image: {orange_ref}. "
+                    "Falling back to built-in HSV defaults.",
+                    err=True,
+                )
+            else:
+                low, high = segmentation.calibrate_orange_hsv(ref_image)
+                orange_hsv_low = low
+                orange_hsv_high = high
+                click.echo(
+                    f"  [orange-ref] Calibrated HSV range: "
+                    f"{low.tolist()} – {high.tolist()}"
+                )
+
+        # 4. Segment surrounding pieces
         click.echo("Detecting missing region...")
-        pieces = segmentation.segment(image)
+        pieces = segmentation.segment(image, orange_hsv_low=orange_hsv_low, orange_hsv_high=orange_hsv_high)
         click.echo(f"  Found {len(pieces)} surrounding piece(s).")
 
-        # 4. Extract edge profiles for each piece
+        # 5. Extract edge profiles for each piece
         click.echo("Extracting edge profiles...")
         all_edges = []
         for piece in pieces:
@@ -124,7 +155,7 @@ def main(
                     f"→ {ep.edge_type.value}{depth_str}"
                 )
 
-        # 5. Compute pixel-to-mm scale from the average bounding-box width of pieces.
+        # 6. Compute pixel-to-mm scale from the average bounding-box width of pieces.
         widths_px = []
         for piece in pieces:
             if piece.bounding_polygon is not None and len(piece.bounding_polygon) >= 2:
@@ -138,7 +169,7 @@ def main(
             f"(avg piece width {avg_piece_width_px:.0f} px = {piece_width_mm:.1f} mm)"
         )
 
-        # 6. Estimate slot dimensions from the surrounding pieces themselves.
+        # 7. Estimate slot dimensions from the surrounding pieces themselves.
         #
         # The slot bounding box from segmentation is unreliable in real photos
         # (shadows, dark artwork, or background can be detected instead of the gap).
@@ -176,7 +207,7 @@ def main(
                 f"{slot_height_px * pixel_to_mm_scale:.1f} mm"
             )
 
-        # 7. Infer the missing piece shape
+        # 8. Infer the missing piece shape
         click.echo("Inferring missing piece shape...")
         shape = inference.infer_shape(
             all_edges,
@@ -188,7 +219,7 @@ def main(
             f"  Shape: {shape.width_mm:.1f} × {shape.height_mm:.1f} mm"
         )
 
-        # 8. Debug images — always produced; --debug-dir overrides the directory.
+        # 9. Debug images — always produced; --debug-dir overrides the directory.
         # Default: same directory as the output file.
         ddir = Path(debug_dir) if debug_dir else Path(output).parent
         det_path = debug_viz.save_detection_image(
@@ -211,7 +242,7 @@ def main(
         if edge_paths:
             click.echo(f"  Debug edge crops:      {ddir / 'debug_edges'}/ ({len(edge_paths)} images)")
 
-        # 9. Generate and write the 3D model
+        # 10. Generate and write the 3D model
         click.echo(f"Generating 3D model (format={output_format})...")
         model_gen.generate(
             shape,
@@ -221,7 +252,7 @@ def main(
             bevel_mm=bevel,
         )
 
-        # 10. Success
+        # 11. Success
         click.echo(f"Done. Output written to: {output}")
 
     except PipelineError as exc:
