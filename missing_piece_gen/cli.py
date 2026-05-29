@@ -7,17 +7,22 @@ from pathlib import Path
 import click
 import cv2
 import numpy as np
+from scipy.ndimage import binary_fill_holes, gaussian_filter
+from scipy.interpolate import splprep, splev
 
 from missing_piece_gen import __version__
 from missing_piece_gen.errors import PipelineError
-from missing_piece_gen import segmentation, edge_analysis, inference, model_gen
-from missing_piece_gen import debug_viz
-from missing_piece_gen.inference import _OPPOSITE
+from missing_piece_gen import segmentation, model_gen
+from missing_piece_gen.models import MissingPieceShape
 
 OUTPUT_FORMATS = ("stl", "obj")
 
-# Default value used when a PieceRegion has no bounding polygon.
-_FALLBACK_PIECE_WIDTH_PX = 100.0
+# Tight HSV range used to locate the orange seed point (Archive analyze.py values)
+_SEED_HSV_LOW  = np.array([0,  150, 150], dtype=np.uint8)
+_SEED_HSV_HIGH = np.array([20, 255, 255], dtype=np.uint8)
+
+# Default scale when no ruler is present and piece-width-mm cannot be applied
+_DEFAULT_PX_PER_MM = 16.0
 
 
 @click.command()
@@ -56,20 +61,23 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
 )
 @click.option(
     "--piece-width-mm",
-    default=20.0,
+    default=None,
     show_default=True,
     type=float,
-    help="Estimated real-world width of a puzzle piece in mm (used for pixel-to-mm scale).",
+    help=(
+        "Real-world width of the missing slot in mm. "
+        "Used to calibrate pixel scale when no ruler is present. "
+        "If omitted, the default of 16 px/mm is used."
+    ),
 )
 @click.option(
     "--debug-dir",
     default=None,
     metavar="<dir>",
     help=(
-        "Directory to write debug images (default: same directory as --output). "
-        "Saves debug_detection.jpg (annotated input showing detected pieces, slot, and "
-        "per-edge TAB/BLANK/FLAT classifications) and debug_shape.jpg (inferred 2D "
-        "outline with edge-type labels and dimensions)."
+        "Directory to write debug images. "
+        "Saves debug_detection.jpg (hole contour overlaid on input) and "
+        "debug_shape.jpg (2D outline rendering)."
     ),
 )
 @click.option(
@@ -77,16 +85,15 @@ _FALLBACK_PIECE_WIDTH_PX = 100.0
     default=None,
     metavar="<path>",
     help=(
-        "Path to a reference photo of just the orange backdrop. "
-        "When supplied, the tool auto-calibrates the HSV detection range from that "
-        "image instead of using the built-in defaults."
+        "Path to a reference photo of just the orange marker. "
+        "Auto-calibrates the HSV detection range from that image."
     ),
 )
 @click.option(
     "--ruler",
     is_flag=True,
     default=False,
-    help="Detect a mm ruler in the image for accurate px/mm scale calibration.",
+    help="Detect a mm ruler at the left edge of the image for accurate px/mm calibration.",
 )
 def main(
     image_path: str,
@@ -94,25 +101,25 @@ def main(
     output_format: str,
     thickness: float,
     bevel: float,
-    piece_width_mm: float,
+    piece_width_mm: float | None,
     debug_dir: str | None,
     orange_ref: str | None,
     ruler: bool,
 ) -> None:
     """Generate a 3D-printable missing puzzle piece from IMAGE_PATH.
 
-    The pipeline detects the missing region in IMAGE_PATH, builds a 3D
-    model of the piece, and writes the result to the output file.
+    Place a piece of orange paper inside the missing slot before photographing.
+    The tool locates the orange, traces the hole boundary using the Archive
+    not-white-complement strategy, fits a smooth B-spline, and extrudes the
+    result into a watertight 3D mesh.
     """
     try:
-        # 1. Validate input path
+        # ── 1. Validate input ─────────────────────────────────────────────────
         if not os.path.exists(image_path):
-            click.echo(
-                f"Error: image path does not exist: {image_path}", err=True
-            )
+            click.echo(f"Error: image path does not exist: {image_path}", err=True)
             sys.exit(1)
 
-        # 2. Load image from disk
+        # ── 2. Load image ─────────────────────────────────────────────────────
         click.echo(f"Loading image: {image_path}")
         image = cv2.imread(image_path)
         if image is None:
@@ -120,10 +127,12 @@ def main(
                 f"Could not read image file: {image_path}. "
                 "Ensure the file is a supported image format."
             )
+        img_h, img_w = image.shape[:2]
+        click.echo(f"  Image size: {img_w}×{img_h} px")
 
-        # 3. Optional: calibrate orange HSV range from a reference photo
-        orange_hsv_low = None
-        orange_hsv_high = None
+        # ── 3. Optional: calibrate orange HSV from reference photo ────────────
+        orange_hsv_low  = _SEED_HSV_LOW.copy()
+        orange_hsv_high = _SEED_HSV_HIGH.copy()
         if orange_ref is not None:
             ref_image = cv2.imread(orange_ref)
             if ref_image is None:
@@ -134,148 +143,149 @@ def main(
                 )
             else:
                 low, high = segmentation.calibrate_orange_hsv(ref_image)
-                orange_hsv_low = low
+                orange_hsv_low  = low
                 orange_hsv_high = high
                 click.echo(
                     f"  [orange-ref] Calibrated HSV range: "
                     f"{low.tolist()} – {high.tolist()}"
                 )
 
-        # 4. Optional: calibrate px/mm scale from a ruler visible in the image
+        # ── 4. Optional: ruler-based px/mm calibration ────────────────────────
         ruler_px_per_mm: float | None = None
         if ruler:
             gray_for_ruler = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            px_per_mm = segmentation.calibrate_from_ruler(gray_for_ruler)
-            if px_per_mm is not None:
-                click.echo(f"  [ruler] Calibrated: {px_per_mm:.1f} px/mm")
-                ruler_px_per_mm = px_per_mm
+            ruler_px_per_mm = segmentation.calibrate_from_ruler(gray_for_ruler)
+            if ruler_px_per_mm is not None:
+                click.echo(f"  [ruler] Calibrated: {ruler_px_per_mm:.2f} px/mm")
             else:
                 click.echo(
-                    "  [ruler] Warning: could not detect ruler ticks, "
-                    "falling back to --piece-width-mm",
+                    "  [ruler] Warning: could not detect ruler ticks.",
                     err=True,
                 )
 
-        # 5. Segment surrounding pieces
+        # ── 5. Detect hole — Archive approach ─────────────────────────────────
         click.echo("Detecting missing region...")
-        pieces = segmentation.segment(image, orange_hsv_low=orange_hsv_low, orange_hsv_high=orange_hsv_high)
-        click.echo(f"  Found {len(pieces)} surrounding piece(s).")
 
-        # 6. Extract edge profiles for each piece
-        click.echo("Extracting edge profiles...")
-        all_edges = []
-        for piece in pieces:
-            profiles = edge_analysis.extract_edges(piece)
-            all_edges.extend(profiles)
-            for ep in profiles:
-                depth_str = (
-                    f", depth={ep.tab_geometry.depth:.1f}px"
-                    if ep.tab_geometry else ""
-                )
-                click.echo(
-                    f"  Piece #{piece.piece_id} {ep.direction!r:8s} "
-                    f"→ {ep.edge_type.value}{depth_str}"
-                )
+        img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray    = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # 7. Compute pixel-to-mm scale.
-        #    When --ruler was used and calibration succeeded, use the ruler value directly.
-        #    Otherwise fall back to the piece-width-mm estimation approach.
-        widths_px = []
-        for piece in pieces:
-            if piece.bounding_polygon is not None and len(piece.bounding_polygon) >= 2:
-                w = float(np.ptp(piece.bounding_polygon[:, 0]))
-                if w > 0:
-                    widths_px.append(w)
-        avg_piece_width_px = float(np.mean(widths_px)) if widths_px else _FALLBACK_PIECE_WIDTH_PX
+        # Step A: find orange seed centroid (tightest HSV range)
+        seed_raw = cv2.inRange(img_hsv, orange_hsv_low, orange_hsv_high)
+        n_s, lbl_s, st_s, _ = cv2.connectedComponentsWithStats(seed_raw, 8)
+        if n_s <= 1:
+            raise PipelineError(
+                "No orange region found in the image. "
+                "Place orange paper in the missing slot before photographing."
+            )
+        big_s = 1 + int(np.argmax(st_s[1:, cv2.CC_STAT_AREA]))
+        m0 = cv2.moments((lbl_s == big_s).astype(np.uint8))
+        if m0["m00"] == 0:
+            raise PipelineError("Orange region has zero area.")
+        seed_x = int(m0["m10"] / m0["m00"])
+        seed_y = int(m0["m01"] / m0["m00"])
+        click.echo(f"  Orange seed: ({seed_x}, {seed_y})")
 
-        if ruler and ruler_px_per_mm is not None:
-            scale_px_per_mm = ruler_px_per_mm
-            pixel_to_mm_scale = 1.0 / scale_px_per_mm
+        # Step B: medianBlur seals text on white puzzle backs (ksize=41 ≈ 20px strokes)
+        gray_med     = cv2.medianBlur(gray, 41)
+        white_sealed = (gray_med > 160).astype(np.uint8) * 255
+        not_white    = cv2.bitwise_not(white_sealed)
+
+        # Step C: connected component from seed = exactly the hole region
+        _, labels_nw = cv2.connectedComponents(not_white, connectivity=8)
+        hole_label   = labels_nw[seed_y, seed_x]
+        if hole_label == 0:
+            raise PipelineError(
+                "The orange seed falls inside a white region after median blur. "
+                "The orange marker may be too small, too bright, or occluded."
+            )
+        blob = (labels_nw == hole_label).astype(np.uint8) * 255
+
+        # Step D: fill_holes → morph_close(9×9) → fill_holes → gaussian(σ=12)
+        blob = binary_fill_holes(blob.astype(bool)).astype(np.uint8) * 255
+        close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, close_k)
+        blob = binary_fill_holes(blob.astype(bool)).astype(np.uint8) * 255
+        blob_f    = gaussian_filter(blob.astype(np.float32) / 255.0, sigma=12)
+        hole_mask = (blob_f > 0.5).astype(np.uint8) * 255
+
+        # Step E: extract contour from cleaned mask
+        contours, _ = cv2.findContours(
+            hole_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if not contours:
+            raise PipelineError("Could not extract hole contour after mask cleanup.")
+        pts_raw = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(float)
+        n_pts = len(pts_raw)
+        click.echo(f"  Contour points (raw): {n_pts}")
+
+        # Step F: fit periodic B-spline (Archive: s=N*20, per=True, 600 samples)
+        if n_pts < 10:
+            raise PipelineError(
+                f"Hole contour has only {n_pts} points; image may be too small."
+            )
+        tck, _ = splprep([pts_raw[:, 0], pts_raw[:, 1]], s=n_pts * 20, per=True, k=3)
+        u_fine = np.linspace(0, 1, 600, endpoint=False)
+        sx, sy  = splev(u_fine, tck)
+        pts_smooth = np.column_stack([sx, sy])
+        click.echo(f"  Spline output points: {len(pts_smooth)}")
+
+        # ── 6. Pixel-to-mm scale ──────────────────────────────────────────────
+        x_min, y_min = pts_smooth.min(axis=0)
+        x_max, y_max = pts_smooth.max(axis=0)
+        hole_width_px  = x_max - x_min
+        hole_height_px = y_max - y_min
+
+        if ruler_px_per_mm is not None:
+            px_per_mm = ruler_px_per_mm
+            click.echo(f"  Scale: {px_per_mm:.2f} px/mm (ruler)")
+        elif piece_width_mm is not None and hole_width_px > 0:
+            px_per_mm = hole_width_px / piece_width_mm
             click.echo(
-                f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
-                f"(ruler calibration: {scale_px_per_mm:.1f} px/mm)"
+                f"  Scale: {px_per_mm:.2f} px/mm "
+                f"(hole {hole_width_px:.0f} px = {piece_width_mm:.1f} mm)"
             )
         else:
-            pixel_to_mm_scale = piece_width_mm / avg_piece_width_px
+            px_per_mm = _DEFAULT_PX_PER_MM
             click.echo(
-                f"  Pixel-to-mm scale: {pixel_to_mm_scale:.4f} mm/px "
-                f"(avg piece width {avg_piece_width_px:.0f} px = {piece_width_mm:.1f} mm)"
+                f"  Scale: {px_per_mm:.2f} px/mm (default — use --piece-width-mm for accuracy)"
             )
 
-        # 8. Estimate slot dimensions from the surrounding pieces themselves.
-        #
-        # The slot bounding box from segmentation is unreliable in real photos
-        # (shadows, dark artwork, or background can be detected instead of the gap).
-        # Derive dimensions from neighbours instead:
-        #   - pieces above/below the slot → their bounding width ≈ slot width
-        #   - pieces left/right of the slot → their bounding height ≈ slot height
-        slot_width_candidates: list[float] = []
-        slot_height_candidates: list[float] = []
-        for piece in pieces:
-            if piece.bounding_polygon is None or len(piece.bounding_polygon) < 2:
-                continue
-            pw = float(np.ptp(piece.bounding_polygon[:, 0]))
-            ph = float(np.ptp(piece.bounding_polygon[:, 1]))
-            for edge_dir in piece.inward_edges:
-                if edge_dir in ("top", "bottom") and pw > 0:
-                    slot_width_candidates.append(pw)
-                elif edge_dir in ("left", "right") and ph > 0:
-                    slot_height_candidates.append(ph)
+        mm_per_px  = 1.0 / px_per_mm
+        width_mm   = hole_width_px  * mm_per_px
+        height_mm  = hole_height_px * mm_per_px
+        click.echo(f"  Hole size: {width_mm:.1f} × {height_mm:.1f} mm")
 
-        slot_width_px: float | None = (
-            float(np.mean(slot_width_candidates)) if slot_width_candidates else None
-        )
-        slot_height_px: float | None = (
-            float(np.mean(slot_height_candidates)) if slot_height_candidates else None
-        )
-        if slot_width_px is None:
-            slot_width_px = avg_piece_width_px if avg_piece_width_px > 0 else None
-        if slot_height_px is None:
-            slot_height_px = avg_piece_width_px if avg_piece_width_px > 0 else None
+        # ── 7. Build mm-space outline ─────────────────────────────────────────
+        outline_mm = (pts_smooth - np.array([x_min, y_min])) * mm_per_px
+        outline_mm = np.vstack([outline_mm, outline_mm[0]])  # close polygon
 
-        if slot_width_px and slot_height_px:
-            click.echo(
-                f"  Piece size estimate: "
-                f"{slot_width_px * pixel_to_mm_scale:.1f} × "
-                f"{slot_height_px * pixel_to_mm_scale:.1f} mm"
-            )
-
-        # 9. Infer the missing piece shape
-        click.echo("Inferring missing piece shape...")
-        shape = inference.infer_shape(
-            all_edges,
-            pixel_to_mm_scale,
-            slot_width_px=slot_width_px,
-            slot_height_px=slot_height_px,
-        )
-        click.echo(
-            f"  Shape: {shape.width_mm:.1f} × {shape.height_mm:.1f} mm"
+        shape = MissingPieceShape(
+            outline=outline_mm,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            pixel_to_mm_scale=mm_per_px,
         )
 
-        # 10. Debug images — always produced; --debug-dir overrides the directory.
-        # Default: same directory as the output file.
+        # ── 8. Debug images ───────────────────────────────────────────────────
         ddir = Path(debug_dir) if debug_dir else Path(output).parent
-        det_path = debug_viz.save_detection_image(
-            image, pieces, all_edges, ddir / "debug_detection.jpg"
-        )
+
+        # Detection debug: overlay hole contour on the original image
+        det_img = image.copy()
+        contour_pts = pts_smooth.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(det_img, [contour_pts], isClosed=True,
+                      color=(0, 255, 0), thickness=3)
+        cv2.circle(det_img, (seed_x, seed_y), 12, (0, 0, 255), -1)
+        det_path = ddir / "debug_detection.jpg"
+        ddir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(det_path), det_img)
         click.echo(f"  Debug detection image: {det_path}")
 
-        # Build profiles_by_dir for the shape image
-        profiles_by_dir: dict = {}
-        for ep in all_edges:
-            missing_dir = _OPPOSITE.get(ep.direction, ep.direction)
-            if missing_dir not in profiles_by_dir:
-                profiles_by_dir[missing_dir] = ep
-        shape_path = debug_viz.save_shape_image(
-            shape, profiles_by_dir, ddir / "debug_shape.jpg"
-        )
-        click.echo(f"  Debug shape image:     {shape_path}")
+        # Shape debug: 2D outline rendering
+        shape_img_path = ddir / "debug_shape.jpg"
+        _save_shape_image(shape, shape_img_path)
+        click.echo(f"  Debug shape image:     {shape_img_path}")
 
-        edge_paths = debug_viz.save_edge_crops(pieces, all_edges, ddir / "debug_edges")
-        if edge_paths:
-            click.echo(f"  Debug edge crops:      {ddir / 'debug_edges'}/ ({len(edge_paths)} images)")
-
-        # 11. Generate and write the 3D model
+        # ── 9. Generate 3D model ──────────────────────────────────────────────
         click.echo(f"Generating 3D model (format={output_format})...")
         model_gen.generate(
             shape,
@@ -284,10 +294,39 @@ def main(
             thickness_mm=thickness,
             bevel_mm=bevel,
         )
-
-        # 12. Success
         click.echo(f"Done. Output written to: {output}")
 
     except PipelineError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
+
+
+def _save_shape_image(shape: MissingPieceShape, output_path: Path) -> None:
+    """Render the 2D outline as a JPEG debug image."""
+    canvas = 900
+    margin = 80
+
+    outline = shape.outline
+    x_vals, y_vals = outline[:, 0], outline[:, 1]
+    x_min, x_max = x_vals.min(), x_vals.max()
+    y_min, y_max = y_vals.min(), y_vals.max()
+    w_mm = x_max - x_min
+    h_mm = y_max - y_min
+
+    scale = (canvas - 2 * margin) / max(w_mm, h_mm, 0.001)
+
+    img = np.ones((canvas, canvas, 3), dtype=np.uint8) * 255
+    pts = np.column_stack([
+        (x_vals - x_min) * scale + margin,
+        (y_vals - y_min) * scale + margin,
+    ]).astype(np.int32)
+
+    cv2.fillPoly(img, [pts], (230, 210, 180))
+    cv2.polylines(img, [pts], isClosed=True, color=(0, 0, 0), thickness=2)
+
+    label = f"{shape.width_mm:.1f} mm  x  {shape.height_mm:.1f} mm"
+    cv2.putText(img, label, (margin, canvas - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), img)

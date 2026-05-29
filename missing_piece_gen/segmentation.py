@@ -34,6 +34,26 @@ _ORANGE_HSV_HIGH = np.array([20, 255, 255], dtype=np.uint8)
 _ORANGE_BACKDROP_FRACTION = 0.10
 
 
+def _fit_bspline_contour(pts: np.ndarray, n_out: int = 600) -> np.ndarray:
+    """Fit a closed periodic B-spline to a contour and return n_out smooth points.
+
+    Archive approach: splprep with s=N*20, per=True, evaluated at n_out evenly-spaced
+    parameter values.  Falls back to the original points on any error (too few points,
+    degenerate curve, etc.).
+    """
+    from scipy.interpolate import splprep, splev
+    n = len(pts)
+    if n < 10:
+        return pts
+    try:
+        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=n * 20, per=True, k=3)
+        u_fine = np.linspace(0, 1, min(n_out, max(n, 60)), endpoint=False)
+        sx, sy = splev(u_fine, tck)
+        return np.column_stack([sx, sy])
+    except Exception:
+        return pts
+
+
 def _check_blur(gray: np.ndarray) -> None:
     """Raise DetectionError if the image is too blurry."""
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -114,6 +134,7 @@ def _find_orange_backdrop(
     hsv: np.ndarray,
     img_w: int,
     img_h: int,
+    gray: np.ndarray | None = None,
     hsv_low: np.ndarray | None = None,
     hsv_high: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, bool, str, np.ndarray | None]:
@@ -147,7 +168,7 @@ def _find_orange_backdrop(
     Returns:
         (contour_or_None, is_backdrop, status_message, cleaned_mask_or_None)
     """
-    from scipy.ndimage import binary_fill_holes, gaussian_filter1d
+    from scipy.ndimage import binary_fill_holes, gaussian_filter
 
     if hsv_low is None:
         hsv_low = _ORANGE_HSV_LOW
@@ -191,27 +212,23 @@ def _find_orange_backdrop(
         # Step D: fill_holes pass 2 (fills topological ring artifact from morph-close around tabs)
         mask = binary_fill_holes(mask.astype(bool)).astype(np.uint8) * 255
 
-        # Step E: Gaussian blur mask + re-threshold (smooths staircase boundary)
-        blurred = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigmaX=10, sigmaY=10)
-        mask = (blurred >= 0.5 * 255).astype(np.uint8) * 255
+        # Step E: Gaussian smooth mask + re-threshold (Archive approach: sigma=12 on
+        # normalised float mask produces a much cleaner boundary than cv2.GaussianBlur).
+        blob_f = gaussian_filter(mask.astype(np.float32) / 255.0, sigma=12)
+        mask = (blob_f > 0.5).astype(np.uint8) * 255
 
         # Extract contour from cleaned mask
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not contours:
             return None, False, "  [orange] No backdrop contour after cleanup.", None
 
-        pts = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-        # Periodic Gaussian smooth (closed contour)
-        pts[:, 0] = gaussian_filter1d(pts[:, 0], sigma=3, mode='wrap')
-        pts[:, 1] = gaussian_filter1d(pts[:, 1], sigma=3, mode='wrap')
-        # Subsample to <=800 points
-        n = len(pts)
-        if n > 800:
-            idx = np.round(np.linspace(0, n - 1, 800)).astype(int)
-            pts = pts[idx]
+        # B-spline smoothing (Archive approach) produces a far smoother closed contour
+        # than the previous gaussian_filter1d + subsample strategy.
+        pts_raw = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+        pts = _fit_bspline_contour(pts_raw, n_out=600)
 
         # Convert back to contour format for cv2 compatibility
-        best = pts.reshape(-1, 1, 2).astype(np.int32)
+        best = pts.astype(np.int32).reshape(-1, 1, 2)
         backdrop_best_area = float(cv2.contourArea(best))
         bx, by, bw, bh = cv2.boundingRect(best)
         msg = (
@@ -249,6 +266,36 @@ def _find_orange_backdrop(
             f"expected HSV {hsv_low.tolist()} - {hsv_high.tolist()}). "
             "Falling back to dark-region slot detection."
         ), None
+
+    # Archive approach: when a grayscale image is available, refine the hole
+    # boundary using medianBlur + not-white complement + seed-connected-component.
+    # This handles shadows on piece edges that cause direct orange tracking to
+    # underestimate the hole area (the key insight from analyze.py in Archive/).
+    if gray is not None:
+        bx_m, by_m, bw_m, bh_m = cv2.boundingRect(marker_best)
+        seed_x = bx_m + bw_m // 2
+        seed_y = by_m + bh_m // 2
+        # ksize=41 covers text strokes up to ~20px thick on white puzzle backs.
+        gray_med = cv2.medianBlur(gray, 41)
+        white_sealed = (gray_med > 160).astype(np.uint8) * 255
+        not_white = cv2.bitwise_not(white_sealed)
+        _, labels_nw = cv2.connectedComponents(not_white, connectivity=8)
+        hole_label = labels_nw[seed_y, seed_x]
+        if hole_label != 0:
+            blob = (labels_nw == hole_label).astype(np.uint8) * 255
+            blob = binary_fill_holes(blob.astype(bool)).astype(np.uint8) * 255
+            close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, close_k)
+            blob = binary_fill_holes(blob.astype(bool)).astype(np.uint8) * 255
+            blob_f = gaussian_filter(blob.astype(np.float32) / 255.0, sigma=12)
+            refined = (blob_f > 0.5).astype(np.uint8) * 255
+            refined_contours, _ = cv2.findContours(
+                refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            )
+            if refined_contours:
+                pts_raw = max(refined_contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+                pts = _fit_bspline_contour(pts_raw, n_out=600)
+                marker_best = pts.astype(np.int32).reshape(-1, 1, 2)
 
     # Report mean HSV of the detected marker so the user can refine the range.
     sx, sy, sw, sh = cv2.boundingRect(marker_best)
@@ -530,6 +577,7 @@ def segment(
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         orange_contour, is_backdrop, orange_msg, cleaned_mask = _find_orange_backdrop(
             hsv, img_w, img_h,
+            gray=gray,
             hsv_low=orange_hsv_low,
             hsv_high=orange_hsv_high,
         )

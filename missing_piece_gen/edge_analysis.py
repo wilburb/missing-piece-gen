@@ -96,12 +96,22 @@ def _extract_single_edge(piece: PieceRegion, direction: str) -> EdgeProfile:
     # Use the largest contour
     contour_raw = max(contours, key=cv2.contourArea)
 
-    # Smooth with approxPolyDP (low epsilon so we keep detail)
-    epsilon = 0.005 * cv2.arcLength(contour_raw, True)
-    contour_smooth = cv2.approxPolyDP(contour_raw, epsilon, True)
-
-    # Reshape to (N, 2) and offset into crop coordinates
-    pts = contour_smooth.reshape(-1, 2).astype(np.float32)
+    # B-spline smoothing (Archive approach): splprep with s=N*20 on the closed
+    # contour gives a far smoother curve than approxPolyDP, preserving tab/blank
+    # geometry while eliminating pixel-staircase noise.
+    pts_raw = contour_raw.reshape(-1, 2).astype(np.float64)
+    n_raw = len(pts_raw)
+    if n_raw >= 10:
+        try:
+            from scipy.interpolate import splprep, splev
+            tck, _ = splprep([pts_raw[:, 0], pts_raw[:, 1]], s=n_raw * 20, per=True, k=3)
+            u_fine = np.linspace(0, 1, min(200, max(n_raw, 20)), endpoint=False)
+            sx_s, sy_s = splev(u_fine, tck)
+            pts = np.column_stack([sx_s, sy_s]).astype(np.float32)
+        except Exception:
+            pts = pts_raw.astype(np.float32)
+    else:
+        pts = pts_raw.astype(np.float32)
     pts[:, 0] += roi_offset[0]  # x offset
     pts[:, 1] += roi_offset[1]  # y offset
 
